@@ -1,0 +1,1 @@
+"""Local Divar crawl panel."""
