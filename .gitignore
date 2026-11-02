@@ -1,0 +1,10 @@
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.db
+divar_token.json
+.idea/
+.vscode/

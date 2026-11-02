@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>پنل خزش دیوار</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <h1>پنل خزش دیوار</h1>
+      <p class="muted">اجرای محلی. توکن‌ها فقط روی همین رایانه می‌مانند.</p>
+    </div>
+    <nav>
+      <button class="tab active" data-tab="jobs">کارها</button>
+      <button class="tab" data-tab="results">نتایج</button>
+      <button class="tab" data-tab="accounts">حساب‌ها</button>
+      <button class="tab" data-tab="settings">تنظیمات</button>
+    </nav>
+  </header>
+  <p class="banner">جمع‌آوری خودکار ممکن است خلاف شرایط استفاده دیوار باشد. از حساب ثانویه استفاده کنید و پیام انبوه نفرستید. دیوار بعد از درخواست زیاد، پاسخ را کند می‌کند.</p>
+
+  <section id="jobs" class="panel">
+    <form id="job-form" class="card">
+      <h2>کار تازه</h2>
+      <label>نام کار <input name="name" placeholder="مثلاً سالن‌های تهران" /></label>
+      <label>دسته
+        <input id="category-search" placeholder="جستجوی نام دسته" />
+        <select id="category" name="category" required></select>
+      </label>
+      <label>اسلاگ آزاد (اگر در فهرست نیست)
+        <input name="category_free" placeholder="beauty-and-haircare" dir="ltr" />
+      </label>
+      <label>کلمه جستجو (اختیاری، با ویرگول)
+        <input name="keywords" placeholder="آرایشگاه، سالن زیبایی" />
+      </label>
+      <label>شهر
+        <input id="city-search" placeholder="تهران" />
+        <select id="city" name="city_id"></select>
+      </label>
+      <div class="row">
+        <label>فیلتر عنوان <input name="title_filter" placeholder="سالن" /></label>
+        <label>فیلتر توضیحات <input name="desc_filter" /></label>
+        <label>حداکثر صفحه <input name="max_pages" type="number" min="1" max="200" value="2" /></label>
+      </div>
+      <div class="row checks">
+        <label><input type="checkbox" name="fetch_details" checked /> دریافت جزئیات</label>
+        <label><input type="checkbox" name="fetch_phones" /> دریافت شماره (نیاز به حساب)</label>
+      </div>
+      <button type="submit">افزودن کار</button>
+    </form>
+    <div id="job-list" class="stack"></div>
+  </section>
+
+  <section id="results" class="panel hidden">
+    <div class="toolbar">
+      <input id="filter" placeholder="جستجو در عنوان، محله، شماره…" />
+      <select id="filter-job"><option value="">همه کارها</option></select>
+      <button id="export-csv" type="button">خروجی CSV</button>
+      <button id="export-xlsx" type="button">خروجی Excel</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th data-sort="title">عنوان</th>
+            <th>لینک</th>
+            <th data-sort="district">محله</th>
+            <th data-sort="price_text">قیمت</th>
+            <th>خلاصه</th>
+            <th data-sort="phone">شماره</th>
+            <th data-sort="job_id">کار</th>
+            <th data-sort="created_at">زمان</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <h2>گزارش زنده</h2>
+    <pre id="log" class="log"></pre>
+  </section>
+
+  <section id="accounts" class="panel hidden">
+    <form id="account-form" class="card">
+      <h2>افزودن حساب دیوار</h2>
+      <p class="muted">کد پیامک را خودتان اینجا وارد می‌کنید. هیچ پیامی از طرف پنل به کسی فرستاده نمی‌شود جز درخواست کد برای همین شماره.</p>
+      <div class="row">
+        <label>موبایل <input name="phone" placeholder="0912…" dir="ltr" required /></label>
+        <label>پروکسی (اختیاری) <input name="proxy" placeholder="http://127.0.0.1:8080" dir="ltr" /></label>
+        <label>سقف روزانه شماره <input name="daily_cap" type="number" value="50" min="1" /></label>
+      </div>
+      <div class="row">
+        <label>کمترین تأخیر (ثانیه) <input name="delay_min" type="number" value="20" min="5" /></label>
+        <label>بیشترین تأخیر <input name="delay_max" type="number" value="40" min="5" /></label>
+        <label>کد پیامک <input name="code" dir="ltr" /></label>
+      </div>
+      <div class="row">
+        <button type="button" id="send-code">دریافت کد</button>
+        <button type="submit">تأیید و ذخیره</button>
+      </div>
+      <p id="account-msg" class="muted"></p>
+    </form>
+    <div id="account-list" class="stack"></div>
+  </section>
+
+  <section id="settings" class="panel hidden">
+    <form id="settings-form" class="card">
+      <h2>محدودیت نرخ</h2>
+      <label>درخواست ناشناس در ثانیه <input name="anon_rps" type="number" step="0.1" min="0.1" max="5" value="1" /></label>
+      <label>سقف پیش‌فرض شماره در روز <input name="default_daily_cap" type="number" value="50" /></label>
+      <div class="row">
+        <label>تأخیر پیش‌فرض از <input name="delay_min" type="number" value="20" /></label>
+        <label>تا <input name="delay_max" type="number" value="40" /></label>
+      </div>
+      <button type="submit">ذخیره</button>
+      <button type="button" id="refresh-cities">به‌روزرسانی فهرست شهرها</button>
+      <p id="settings-msg" class="muted"></p>
+    </form>
+  </section>
+  <script src="/static/app.js"></script>
+</body>
+</html>
