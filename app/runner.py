@@ -130,6 +130,9 @@ class JobManager:
             index = job["query_index"]
             if index >= len(queries):
                 await self._drain_phones(job_id)
+                leftover = self.db.pending_phones(job_id, limit=1)
+                if leftover:
+                    self._log(job_id, "صف شماره خالی نشد؛ کار را دوباره شروع کنید", "warn")
                 fresh = self.db.get_job(job_id)
                 if fresh and fresh["status"] == "running":
                     self.db.set_status(job_id, "done")
@@ -182,12 +185,11 @@ class JobManager:
                     "red_text": row["red_text"],
                     "found_by": label,
                 }
-                saved = self.db.upsert_listing(job_id, record)
-                if not saved:
-                    continue
-                added += 1
-                self.hub.publish("listing", _public_listing(saved, job["name"]))
-                if job["fetch_details"]:
+                saved, created = self.db.upsert_listing(job_id, record)
+                if created:
+                    added += 1
+                    self.hub.publish("listing", _public_listing(saved, job["name"]))
+                if _needs_detail(saved, job):
                     await self._fetch_detail(job_id, saved, job)
             new_page = job["page"] + 1
             finished_query = (not has_next) or new_page >= job["max_pages"]
@@ -237,7 +239,7 @@ class JobManager:
             self.hub.publish("listing", _public_listing(updated, job["name"]))
             return
         phone_status = "none"
-        if job["fetch_phones"] and parsed["contact_uuid"]:
+        if job["fetch_phones"]:
             phone_status = "pending"
         updated = self.db.update_listing(
             listing["id"],
@@ -251,12 +253,12 @@ class JobManager:
         )
         self.hub.publish("listing", _public_listing(updated, job["name"]))
 
-    async def _drain_phones(self, job_id: int, limit: int = 50) -> None:
+    async def _drain_phones(self, job_id: int, limit: int | None = None) -> None:
         job = self.db.get_job(job_id)
         if not job or not job["fetch_phones"]:
             return
         handled = 0
-        while handled < limit:
+        while limit is None or handled < limit:
             if not await self._wait_controls(job_id):
                 return
             pending = self.db.pending_phones(job_id, limit=1)
@@ -305,6 +307,10 @@ class JobManager:
             phones = "، ".join(outcome["phones"])
             phone_status = "done" if kind == "phones" else "empty"
             updated = self.db.update_listing(listing["id"], phone=phones, phone_status=phone_status)
+            if phones:
+                self._log(job_id, f"شماره {listing['token']}: {phones}")
+            else:
+                self._log(job_id, f"شماره‌ای برای {listing['token']} نبود")
             self.db.update_account(
                 account["id"],
                 views_today=int(account["views_today"]) + 1,
@@ -334,6 +340,16 @@ class JobManager:
             if not chosen:
                 return None
             return next(row for row in secrets if row["id"] == chosen.id)
+
+
+def _needs_detail(listing: dict[str, Any], job: dict[str, Any]) -> bool:
+    if listing.get("phone_status") in {"done", "empty", "skipped"}:
+        return job["fetch_details"] and listing.get("description") is None
+    if job["fetch_phones"] and listing.get("phone_status") != "pending":
+        return True
+    if listing.get("phone_status") == "pending":
+        return False
+    return bool(job["fetch_details"]) and listing.get("description") is None
 
 
 def _public_listing(row: dict[str, Any], job_name: str) -> dict[str, Any]:

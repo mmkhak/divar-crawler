@@ -220,15 +220,15 @@ class Database:
             ).fetchall()
         return [row["id"] for row in rows]
 
-    def upsert_listing(self, job_id: int, record: dict[str, Any]) -> dict[str, Any] | None:
+    def upsert_listing(self, job_id: int, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         stamp = now_iso()
         with self._lock:
             existing = self._conn.execute(
-                "SELECT id FROM listings WHERE job_id=? AND token=?",
+                "SELECT * FROM listings WHERE job_id=? AND token=?",
                 (job_id, record["token"]),
             ).fetchone()
             if existing:
-                return None
+                return dict(existing), False
             self._conn.execute(
                 """INSERT INTO listings(
                     job_id, token, title, district, price_text, snippet, description, phone,
@@ -258,7 +258,7 @@ class Database:
                 "SELECT * FROM listings WHERE job_id=? AND token=?",
                 (job_id, record["token"]),
             ).fetchone()
-        return dict(row)
+        return dict(row), True
 
     def update_listing(self, listing_id: int, **fields: Any) -> dict[str, Any]:
         cols = ", ".join(f"{key}=?" for key in fields)

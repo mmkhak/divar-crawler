@@ -146,7 +146,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 "title_filter": _split_words(body.title_filter),
                 "desc_filter": _split_words(body.desc_filter),
                 "max_pages": max(1, min(body.max_pages, 200)),
-                "fetch_details": body.fetch_details,
+                "fetch_details": body.fetch_details or body.fetch_phones,
                 "fetch_phones": body.fetch_phones,
             }
         )

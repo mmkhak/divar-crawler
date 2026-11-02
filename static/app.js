@@ -81,6 +81,10 @@ function renderJobs() {
   }).join("") || `<p class="muted">هنوز کاری نیست.</p>`;
 }
 
+function phoneStatusLabel(status) {
+  return { pending: "در صف شماره", skipped: "رد شد", empty: "بدون شماره" }[status] || "";
+}
+
 function statusLabel(status) {
   return { running: "در حال اجرا", paused: "متوقف موقت", stopped: "متوقف", done: "تمام", error: "خطا", limited: "محدود امروز", expired: "منقضی", active: "فعال" }[status] || status;
 }
@@ -121,7 +125,7 @@ function paintRows() {
     <td>${escapeHtml(row.district || "")}</td>
     <td>${escapeHtml(row.price_text || "")}</td>
     <td class="snip">${escapeHtml(row.snippet || "")}</td>
-    <td dir="ltr">${escapeHtml(row.phone || "")}</td>
+    <td dir="ltr">${escapeHtml(row.phone || phoneStatusLabel(row.phone_status))}</td>
     <td>${escapeHtml(row.job_name || "")}</td>
     <td>${escapeHtml((row.created_at || "").replace("T", " ").slice(0, 16))}</td>
   </tr>`).join("");
@@ -138,6 +142,12 @@ function appendLog(entry) {
   log.scrollTop = log.scrollHeight;
 }
 
+$("#fetch-phones").addEventListener("change", (event) => {
+  if (event.target.checked) {
+    document.querySelector('input[name="fetch_details"]').checked = true;
+  }
+});
+
 $("#job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.target);
@@ -150,8 +160,8 @@ $("#job-form").addEventListener("submit", async (event) => {
     title_filter: [form.get("title_filter")].filter(Boolean),
     desc_filter: [form.get("desc_filter")].filter(Boolean),
     max_pages: Number(form.get("max_pages") || 2),
-    fetch_details: form.get("fetch_details") === "on",
     fetch_phones: form.get("fetch_phones") === "on",
+    fetch_details: form.get("fetch_details") === "on" || form.get("fetch_phones") === "on",
   };
   try {
     await api("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

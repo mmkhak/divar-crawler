@@ -152,3 +152,62 @@ def test_confirm_saves_token_without_leaking_it(tmp_path):
         secret = app.state.db.account_secrets()[0]
         assert secret["token"] == "secret-token-value"
         assert secret["proxy"] == "http://127.0.0.1:8888"
+
+
+def test_fetch_phones_queues_even_without_details_flag(tmp_path):
+    app = create_app(tmp_path)
+    pages = [_page("phoneTok1", False, 1)]
+    detail = json.loads((FIX / "detail_sample.json").read_text(encoding="utf-8"))
+    contacts = []
+
+    async def search(body):
+        return 200, pages.pop(0), ""
+
+    async def fetch_detail(token):
+        return 200, detail, ""
+
+    async def contact(token, auth_token, contact_uuid, proxy=None):
+        contacts.append((token, auth_token, contact_uuid))
+        return 200, '{"widget_list":[{"text":"09120000000"}]}'
+
+    with TestClient(app) as client:
+        app.state.db.update_settings(
+            {"anon_rps": "20", "default_daily_cap": "50", "delay_min": "0", "delay_max": "0"}
+        )
+        app.state.manager.refresh_rate()
+        app.state.manager.client.search = search
+        app.state.manager.client.detail = fetch_detail
+        app.state.manager.client.contact = contact
+        app.state.db.add_account(
+            {
+                "phone": "09120000000",
+                "token": "acct-token",
+                "daily_cap": 10,
+                "delay_min": 0.01,
+                "delay_max": 0.01,
+            }
+        )
+        created = client.post(
+            "/api/jobs",
+            json={
+                "category": "beauty-and-haircare",
+                "max_pages": 1,
+                "fetch_details": False,
+                "fetch_phones": True,
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["fetch_details"] is True
+        job_id = created.json()["id"]
+        client.post(f"/api/jobs/{job_id}/start")
+        status = "running"
+        for _ in range(80):
+            status = client.get("/api/jobs").json()[0]["status"]
+            if status in {"done", "error"}:
+                break
+            time.sleep(0.05)
+        assert status == "done"
+        rows = client.get("/api/listings").json()
+        assert rows[0]["phone"] == "09120000000"
+        assert rows[0]["phone_status"] == "done"
+        assert contacts and contacts[0][0] == "phoneTok1"
