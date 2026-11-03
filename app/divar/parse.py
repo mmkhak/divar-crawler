@@ -1,12 +1,17 @@
 """Pure parsers for Divar search, detail, and contact responses."""
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
 FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 PHONE_RE = re.compile(
-    r"(?<![\w-])(?:\+98|0098|0)?9\d{9}(?![\w-])|(?<![\w-])0\d{10}(?![\w-])"
+    r"(?<!\d)(?:\+98|0098|0)?9\d{9}(?!\d)|(?<!\d)0\d{10}(?!\d)"
+)
+FLEX_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+98|0098|0)?[\s\-–—._]*9(?:[\s\-–—._]*\d){9}(?!\d)"
+    r"|(?<!\d)0(?:[\s\-–—._]*\d){10}(?!\d)"
 )
 LIMIT_RE = re.compile(r"limit|محدودیت|سقف|بیش از حد", re.I)
 
@@ -131,14 +136,62 @@ def matches_keywords(text: str, keywords: list[str]) -> bool:
     return any(word.lower() in haystack for word in keywords if word.strip())
 
 
+def _canon_one(raw: str) -> str | None:
+    digits = re.sub(r"\D", "", (raw or "").translate(FA_DIGITS))
+    if len(digits) == 10 and digits[0] == "9":
+        digits = "0" + digits
+    if len(digits) == 12 and digits.startswith("98"):
+        digits = "0" + digits[2:]
+    if len(digits) == 11 and digits[0] == "0":
+        return digits
+    return None
+
+
 def canonical_phones(text: str) -> list[str]:
     translated = (text or "").translate(FA_DIGITS)
-    found = PHONE_RE.findall(translated)
     ordered: list[str] = []
-    for raw in found:
-        number = "0" + raw[-10:]
-        if number not in ordered and len(number) == 11:
-            ordered.append(number)
+    for pattern in (PHONE_RE, FLEX_PHONE_RE):
+        for raw in pattern.findall(translated):
+            number = _canon_one(raw)
+            if number and number not in ordered:
+                ordered.append(number)
+    return ordered
+
+
+def phones_from_contact(body: str) -> list[str]:
+    """Read numbers from contact_info JSON widgets, then fall back to regex."""
+    ordered = canonical_phones(body)
+    try:
+        payload = json.loads(body or "")
+    except Exception:
+        return ordered
+    if not isinstance(payload, dict):
+        return ordered
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("phone_number", "phone", "mobile", "value"):
+                value = node.get(key)
+                if isinstance(value, str):
+                    for number in canonical_phones(value):
+                        if number not in ordered:
+                            ordered.append(number)
+            action = node.get("action")
+            if isinstance(action, dict):
+                inner = action.get("payload") or {}
+                if isinstance(inner, dict):
+                    phone = inner.get("phone_number")
+                    if isinstance(phone, str):
+                        for number in canonical_phones(phone):
+                            if number not in ordered:
+                                ordered.append(number)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
     return ordered
 
 
@@ -158,7 +211,7 @@ def classify_contact(status: int, body: str) -> dict[str, Any]:
         if LIMIT_RE.search(text):
             return {"kind": "limited", "phones": [], "detail": text[:200]}
         return {"kind": "retry", "phones": [], "detail": text[:200]}
-    phones = canonical_phones(text)
+    phones = phones_from_contact(text)
     if not phones and LIMIT_RE.search(text):
         return {"kind": "limited", "phones": [], "detail": text[:200]}
     if not phones:

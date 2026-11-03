@@ -12,6 +12,7 @@ from app.catalog import load_cities
 from app.db import Database, today_key
 from app.divar.client import DivarClient, RateLimiter, build_search, jitter
 from app.divar.parse import (
+    canonical_phones,
     classify_contact,
     matches_keywords,
     pagination_state,
@@ -119,6 +120,8 @@ class JobManager:
             return
         queries: list[str | None] = list(job["keywords"]) or [None]
         self._log(job_id, "شروع خزش")
+        if job["fetch_phones"]:
+            await self._drain_phones(job_id)
         while True:
             job = self.db.get_job(job_id)
             if not job or job["status"] in {"stopped"}:
@@ -238,6 +241,17 @@ class JobManager:
             )
             self.hub.publish("listing", _public_listing(updated, job["name"]))
             return
+        found = canonical_phones(
+            " ".join(
+                part
+                for part in (
+                    description,
+                    parsed.get("subtitle") or "",
+                    " ".join(str(v) for v in (parsed.get("specs") or {}).values()),
+                )
+                if part
+            )
+        )
         phone_status = "none"
         if job["fetch_phones"]:
             phone_status = "pending"
@@ -246,6 +260,7 @@ class JobManager:
             description=description,
             snippet=snippet(description or parsed["subtitle"] or listing.get("snippet") or ""),
             contact_uuid=parsed["contact_uuid"],
+            phone="، ".join(found) if found else listing.get("phone"),
             phone_status=phone_status,
             specs_json=json.dumps(parsed["specs"], ensure_ascii=False),
             breadcrumb=" > ".join(part for part in parsed["breadcrumb"] if part),
@@ -304,11 +319,25 @@ class JobManager:
             if kind == "retry":
                 self._log(job_id, f"پاسخ شماره {status}؛ بعداً دوباره", "warn")
                 return
-            phones = "، ".join(outcome["phones"])
-            phone_status = "done" if kind == "phones" else "empty"
-            updated = self.db.update_listing(listing["id"], phone=phones, phone_status=phone_status)
+            phones = list(outcome["phones"])
+            if not phones:
+                phones = canonical_phones(
+                    " ".join(
+                        part
+                        for part in (
+                            listing.get("phone") or "",
+                            listing.get("description") or "",
+                            listing.get("snippet") or "",
+                            listing.get("specs_json") or "",
+                        )
+                        if part
+                    )
+                )
+            joined = "، ".join(phones)
+            phone_status = "done" if phones else "empty"
+            updated = self.db.update_listing(listing["id"], phone=joined, phone_status=phone_status)
             if phones:
-                self._log(job_id, f"شماره {listing['token']}: {phones}")
+                self._log(job_id, f"شماره {listing['token']}: {joined}")
             else:
                 self._log(job_id, f"شماره‌ای برای {listing['token']} نبود")
             self.db.update_account(

@@ -82,7 +82,11 @@ class DivarClient:
         contact_uuid: str | None,
         proxy: str | None = None,
     ) -> tuple[int, str]:
-        headers = {"Authorization": "Basic " + auth_token}
+        headers = {
+            "Authorization": "Basic " + auth_token,
+            "Origin": "https://divar.ir",
+            "Referer": f"https://divar.ir/v/{token}",
+        }
         body = {"contact_uuid": contact_uuid} if contact_uuid else {}
         async with self._client(proxy) as client:
             response = await client.post(

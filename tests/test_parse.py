@@ -10,6 +10,7 @@ from app.divar.parse import (
     normalize_phone_input,
     pagination_state,
     parse_detail,
+    phones_from_contact,
     parse_search_rows,
     search_body,
 )
@@ -63,6 +64,28 @@ def test_phone_parser_is_defensive():
     assert classify_contact(429, "rate")["kind"] == "limited"
     assert classify_contact(404, "")["kind"] == "missing"
     assert classify_contact(500, "oops")["kind"] == "retry"
+    assert canonical_phones("شماره۰۹۱۲۳۴۵۶۷۸۹") == ["09123456789"]
+    assert canonical_phones("۰۹۱۲-۳۴۵-۶۷۸۹") == ["09123456789"]
+    widget = json.dumps(
+        {
+            "widget_list": [
+                {
+                    "widget_type": "UNEXPANDABLE_ROW",
+                    "data": {
+                        "title": "شمارهٔ موبایل",
+                        "value": "۰۹۳۰۵۳۵۲۳۲۰",
+                        "action": {
+                            "type": "CALL_PHONE",
+                            "payload": {"phone_number": "09305352320"},
+                        },
+                    },
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    assert phones_from_contact(widget) == ["09305352320"]
+    assert classify_contact(200, widget)["kind"] == "phones"
 
 
 def test_auth_token_and_phone_normalize():
