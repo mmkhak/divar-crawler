@@ -238,7 +238,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         status, payload, text = await app.state.auth.confirm_code(phone, code, _proxy(body.proxy))
         if status != 200:
             raise HTTPException(status, _safe_error(text))
-        token = extract_token(payload)
+        cookies = (payload or {}).get("_cookies") if isinstance(payload, dict) else None
+        token = extract_token(payload, cookies if isinstance(cookies, dict) else None)
         if not token:
             raise HTTPException(502, "توکن در پاسخ دیوار نبود")
         settings = db.settings()

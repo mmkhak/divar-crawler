@@ -23,12 +23,17 @@ def normalize_phone_input(raw: str) -> str:
     return "0" + digits[-10:]
 
 
-def extract_token(payload: dict[str, Any] | None) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    token = payload.get("token") or payload.get("access_token")
-    if isinstance(token, str) and token.strip():
-        return token.strip()
+def extract_token(payload: dict[str, Any] | None, cookies: dict[str, str] | None = None) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("sAccessToken", "token", "access_token"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if cookies:
+        for key in ("sAccessToken", "token"):
+            value = cookies.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
 
 

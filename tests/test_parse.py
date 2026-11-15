@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from app.accounts import AccountView, pick_account
+from app.divar.client import auth_headers, browser_headers, session_cookies
 from app.divar.parse import (
     canonical_phones,
     classify_contact,
@@ -91,6 +92,8 @@ def test_phone_parser_is_defensive():
 def test_auth_token_and_phone_normalize():
     assert extract_token({"token": "abc"}) == "abc"
     assert extract_token({"access_token": "xyz"}) == "xyz"
+    assert extract_token({"sAccessToken": "web-jwt"}) == "web-jwt"
+    assert extract_token({}, {"sAccessToken": "cookie-jwt"}) == "cookie-jwt"
     assert extract_token({}) is None
     assert normalize_phone_input("۰۹۱۲۱۲۳۴۵۶۷") == "09121234567"
     assert normalize_phone_input("+989121234567") == "09121234567"
@@ -116,3 +119,28 @@ def test_round_robin_skips_blocked_accounts():
     refreshed = AccountView(2, "limited", 10, 50, "2026-10-31", 20, 40)
     picked, _ = pick_account([refreshed], 0, today)
     assert picked.id == 2
+
+
+def test_browser_session_looks_like_divar_web():
+    headers = browser_headers(listing_token="ga5zZ8ke")
+    assert headers["Origin"] == "https://divar.ir"
+    assert headers["Referer"] == "https://divar.ir/v/ga5zZ8ke"
+    assert headers["x-render-type"] == "CSR"
+    assert headers["x-web-serving-mode"] == "desktop"
+    cookies = session_cookies("device-1", "jwt-token")
+    assert cookies["did"] == "device-1"
+    assert cookies["sAccessToken"] == "jwt-token"
+    assert auth_headers("jwt-token")["Authorization"] == "Basic jwt-token"
+
+
+def test_send_report_payloads():
+    from app.divar.reports import contact_api_report, post_detail_boot_reports
+
+    boots = post_detail_boot_reports("view-1")
+    assert len(boots) == 3
+    assert boots[0]["reports"][0]["user_event"]["web_page_load_event"]["context"]["page"] == "POST_DETAIL"
+    assert boots[1]["reports"][0]["user_event"]["web_page_load_event"]["load_status"]["status"] == "BOOT"
+    assert boots[2]["reports"][0]["user_event"]["web_page_load_event"]["load_status"]["status"] == "READY"
+    report = contact_api_report("ga5zZ8ke", 200, 200)
+    assert "contact_info_v2/ga5zZ8ke" in report["reports"][0]["api_call"]["path"]
+    assert report["reports"][0]["api_call"]["status_code"] == 200

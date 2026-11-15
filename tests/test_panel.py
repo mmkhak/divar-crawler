@@ -170,6 +170,12 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         contacts.append((token, auth_token, contact_uuid))
         return 200, '{"widget_list":[{"text":"09120000000"}]}'
 
+    async def send_report(*args, **kwargs):
+        return 204
+
+    async def send_post_detail_reports(*args, **kwargs):
+        return None
+
     with TestClient(app) as client:
         app.state.db.update_settings(
             {"anon_rps": "20", "default_daily_cap": "50", "delay_min": "0", "delay_max": "0"}
@@ -178,6 +184,8 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         app.state.manager.client.search = search
         app.state.manager.client.detail = fetch_detail
         app.state.manager.client.contact = contact
+        app.state.manager.client.send_report = send_report
+        app.state.manager.client.send_post_detail_reports = send_post_detail_reports
         app.state.db.add_account(
             {
                 "phone": "09120000000",
