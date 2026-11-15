@@ -144,3 +144,18 @@ def test_send_report_payloads():
     report = contact_api_report("ga5zZ8ke", 200, 200)
     assert "contact_info_v2/ga5zZ8ke" in report["reports"][0]["api_call"]["path"]
     assert report["reports"][0]["api_call"]["status_code"] == 200
+
+
+def test_traffic_buffer_redacts_tokens():
+    from app.divar.traffic import TrafficBuffer, redact
+
+    assert "***" in redact("Authorization: Basic eyJhbGciOi.secret")
+    buffer = TrafficBuffer(limit=2)
+    buffer.record("POST", "https://api.divar.ir/v8/x", 200, 12, "Basic abc.def")
+    assert "***" in buffer.recent()[0]["note"]
+    buffer.record("GET", "https://api.divar.ir/v8/y", 404, 5, "ok")
+    buffer.record("GET", "https://api.divar.ir/v8/z", 200, 3, "ok")
+    rows = buffer.recent()
+    assert len(rows) == 2
+    assert rows[0]["url"].endswith("/y")
+    assert rows[1]["url"].endswith("/z")

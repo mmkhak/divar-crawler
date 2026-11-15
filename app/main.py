@@ -14,6 +14,7 @@ from app.catalog import load_categories, load_cities, refresh_cities, search_cit
 from app.db import Database
 from app.divar.client import DivarClient
 from app.divar.parse import FA_DIGITS, extract_token, normalize_phone_input
+from app.divar.traffic import TrafficBuffer
 from app.exporting import listing_row, to_csv, to_xlsx
 from app.hub import EventHub
 from app.runner import JobManager, city_name
@@ -71,13 +72,16 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     data.mkdir(parents=True, exist_ok=True)
     db = Database(data / "panel.db")
     hub = EventHub()
-    manager = JobManager(db, hub, data)
-    auth_client = DivarClient()
+    traffic = TrafficBuffer()
+    traffic.on_entry(lambda entry: hub.publish("traffic", entry))
+    manager = JobManager(db, hub, data, traffic=traffic)
+    auth_client = DivarClient(traffic=traffic)
     app = FastAPI(title="پنل دیوار")
     app.state.db = db
     app.state.manager = manager
     app.state.data = data
     app.state.auth = auth_client
+    app.state.traffic = traffic
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -195,6 +199,15 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     @app.get("/api/logs")
     async def logs(job_id: int | None = None) -> list[dict[str, Any]]:
         return db.recent_logs(300, job_id)
+
+    @app.get("/api/traffic")
+    async def traffic_logs(limit: int = Query(200, le=400)) -> list[dict[str, Any]]:
+        return app.state.traffic.recent(limit)
+
+    @app.delete("/api/traffic")
+    async def clear_traffic() -> dict[str, bool]:
+        app.state.traffic.clear()
+        return {"ok": True}
 
     @app.get("/api/events")
     async def events() -> StreamingResponse:

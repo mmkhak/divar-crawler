@@ -20,15 +20,23 @@ from app.divar.parse import (
     parse_search_rows,
     snippet,
 )
+from app.divar.traffic import TrafficBuffer
 from app.hub import EventHub
 
 
 class JobManager:
-    def __init__(self, db: Database, hub: EventHub, data_dir: Any) -> None:
+    def __init__(
+        self,
+        db: Database,
+        hub: EventHub,
+        data_dir: Any,
+        traffic: TrafficBuffer | None = None,
+    ) -> None:
         self.db = db
         self.hub = hub
         self.data_dir = data_dir
-        self.client = DivarClient()
+        self.traffic = traffic or TrafficBuffer()
+        self.client = DivarClient(traffic=self.traffic)
         self.limiter = RateLimiter(float(db.setting("anon_rps") or 1))
         self._tasks: dict[int, asyncio.Task] = {}
         self._pause: dict[int, asyncio.Event] = {}

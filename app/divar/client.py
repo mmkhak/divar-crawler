@@ -12,6 +12,7 @@ import httpx
 
 from app.divar.parse import search_body
 from app.divar.reports import contact_api_report, post_detail_boot_reports
+from app.divar.traffic import TrafficBuffer
 
 SEARCH_URL = "https://api.divar.ir/v8/postlist/w/search"
 POST_URL = "https://api.divar.ir/v8/posts-v2/web/{token}"
@@ -48,9 +49,21 @@ class RateLimiter:
 
 
 class DivarClient:
-    def __init__(self, timeout: float = 25.0) -> None:
+    def __init__(self, timeout: float = 25.0, traffic: TrafficBuffer | None = None) -> None:
         self.timeout = timeout
+        self.traffic = traffic or TrafficBuffer()
         self._did = str(uuid.uuid4())
+
+    def _trace(
+        self,
+        method: str,
+        url: str,
+        status: int,
+        started: float,
+        note: str = "",
+    ) -> None:
+        elapsed_ms = max(int((time.monotonic() - started) * 1000), 0)
+        self.traffic.record(method, url, status, elapsed_ms, note)
 
     def _client(
         self,
@@ -68,14 +81,19 @@ class DivarClient:
         return httpx.AsyncClient(**kwargs)
 
     async def search(self, body: dict[str, Any]) -> tuple[int, dict[str, Any] | None, str]:
+        started = time.monotonic()
         async with self._client() as client:
             response = await client.post(SEARCH_URL, json=body)
+            self._trace("POST", SEARCH_URL, response.status_code, started, "search")
             return _json_response(response)
 
     async def detail(self, token: str) -> tuple[int, dict[str, Any] | None, str]:
         await self.send_post_detail_reports(token)
+        url = POST_URL.format(token=token)
+        started = time.monotonic()
         async with self._client(listing_token=token) as client:
-            response = await client.get(POST_URL.format(token=token))
+            response = await client.get(url)
+            self._trace("GET", url, response.status_code, started, f"detail {token}")
             return _json_response(response)
 
     async def send_report(
@@ -91,13 +109,17 @@ class DivarClient:
             "Content-Type": "text/plain;charset=UTF-8",
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        note = _report_note(payload)
+        started = time.monotonic()
         try:
             async with self._client(
                 proxy=proxy, auth_token=auth_token, listing_token=listing_token
             ) as client:
                 response = await client.post(REPORT_URL, content=body, headers=headers)
+                self._trace("POST", REPORT_URL, response.status_code, started, note)
                 return response.status_code
-        except Exception:
+        except Exception as exc:
+            self._trace("POST", REPORT_URL, 0, started, f"{note} err={exc}")
             return 0
 
     async def send_post_detail_reports(
@@ -110,15 +132,19 @@ class DivarClient:
             await self.send_report(payload, listing_token, auth_token, proxy)
 
     async def request_code(self, phone: str, proxy: str | None = None) -> tuple[int, str]:
+        started = time.monotonic()
         async with self._client(proxy) as client:
             response = await client.post(AUTH_URL, json={"phone": phone})
+            self._trace("POST", AUTH_URL, response.status_code, started, f"auth {phone}")
             return response.status_code, response.text
 
     async def confirm_code(
         self, phone: str, code: str, proxy: str | None = None
     ) -> tuple[int, dict[str, Any] | None, str]:
+        started = time.monotonic()
         async with self._client(proxy) as client:
             response = await client.post(CONFIRM_URL, json={"phone": phone, "code": code})
+            self._trace("POST", CONFIRM_URL, response.status_code, started, f"confirm {phone}")
             status, payload, text = _json_response(response)
             cookies = {key: value for key, value in response.cookies.items()}
             if cookies:
@@ -140,12 +166,18 @@ class DivarClient:
     ) -> tuple[int, str]:
         headers = auth_headers(auth_token)
         body = {"contact_uuid": contact_uuid} if contact_uuid else {}
+        url = CONTACT_URL.format(token=token)
         started = time.monotonic()
         async with self._client(proxy, auth_token=auth_token, listing_token=token) as client:
-            response = await client.post(
-                CONTACT_URL.format(token=token), json=body, headers=headers
-            )
+            response = await client.post(url, json=body, headers=headers)
             elapsed_ms = int((time.monotonic() - started) * 1000)
+            self._trace(
+                "POST",
+                url,
+                response.status_code,
+                started,
+                f"contact uuid={contact_uuid or '-'}",
+            )
             await self.send_report(
                 contact_api_report(token, response.status_code, max(elapsed_ms, 1)),
                 listing_token=token,
@@ -155,11 +187,35 @@ class DivarClient:
             return response.status_code, response.text
 
     async def fetch_cities(self) -> tuple[int, Any]:
+        started = time.monotonic()
         async with self._client() as client:
             response = await client.get(CITIES_URL)
+            self._trace("GET", CITIES_URL, response.status_code, started, "cities")
             if response.status_code != 200:
                 return response.status_code, None
             return 200, response.json()
+
+
+def _report_note(payload: dict[str, Any]) -> str:
+    reports = payload.get("reports") or []
+    kinds: list[str] = []
+    for item in reports[:3]:
+        if not isinstance(item, dict):
+            continue
+        if "api_call" in item:
+            path = (item["api_call"] or {}).get("path") or ""
+            kinds.append("api_call " + path.rsplit("/", 1)[-1][:40])
+        elif "user_event" in item:
+            event = item["user_event"] or {}
+            if "web_page_load_event" in event:
+                load = event["web_page_load_event"] or {}
+                status = ((load.get("load_status") or {}).get("status")) or "liveness"
+                kinds.append(f"page_load {status}")
+            else:
+                kinds.append("user_event")
+        else:
+            kinds.append(next(iter(item), "report"))
+    return "send-report " + (", ".join(kinds) or "empty")
 
 
 def browser_headers(listing_token: str | None = None) -> dict[str, str]:

@@ -63,6 +63,13 @@ td.snip { max-width: 280px; color: #3d3832; }
   overflow: auto;
   white-space: pre-wrap;
 }
+.traffic-log {
+  max-height: 70vh;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .82rem;
+  direction: ltr;
+  text-align: left;
+}
 .status { font-weight: 700; }
 .status.running { color: var(--accent); }
 .status.paused, .status.limited { color: #9a6700; }

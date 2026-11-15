@@ -142,6 +142,20 @@ function appendLog(entry) {
   log.scrollTop = log.scrollHeight;
 }
 
+function appendTraffic(entry) {
+  const time = (entry.created_at || "").slice(11, 19);
+  const note = entry.note ? ` · ${entry.note}` : "";
+  const line = `[${time}] ${entry.method} ${entry.status} ${entry.elapsed_ms}ms ${entry.url}${note}\n`;
+  const log = $("#traffic-log");
+  log.textContent += line;
+  log.scrollTop = log.scrollHeight;
+}
+
+$("#clear-traffic").addEventListener("click", async () => {
+  await api("/api/traffic", { method: "DELETE" });
+  $("#traffic-log").textContent = "";
+});
+
 $("#fetch-phones").addEventListener("change", (event) => {
   if (event.target.checked) {
     document.querySelector('input[name="fetch_details"]').checked = true;
@@ -279,6 +293,7 @@ function connect() {
   const source = new EventSource("/api/events");
   source.addEventListener("listing", (event) => upsertRow(JSON.parse(event.data)));
   source.addEventListener("log", (event) => appendLog(JSON.parse(event.data)));
+  source.addEventListener("traffic", (event) => appendTraffic(JSON.parse(event.data)));
   source.addEventListener("job", (event) => {
     const job = JSON.parse(event.data);
     const index = state.jobs.findIndex((item) => item.id === job.id);
@@ -304,6 +319,7 @@ async function boot() {
   existing.forEach((row) => state.rows.set(row.job_id + ":" + row.token, row));
   paintRows();
   (await api("/api/logs")).forEach(appendLog);
+  (await api("/api/traffic")).forEach(appendTraffic);
   renderAccounts(await api("/api/accounts"));
   connect();
   const tab = (location.hash || "").replace("#", "");

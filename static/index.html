@@ -15,6 +15,7 @@
     <nav>
       <button class="tab active" data-tab="jobs">کارها</button>
       <button class="tab" data-tab="results">نتایج</button>
+      <button class="tab" data-tab="traffic">درخواست‌های دیوار</button>
       <button class="tab" data-tab="accounts">حساب‌ها</button>
       <button class="tab" data-tab="settings">تنظیمات</button>
     </nav>
@@ -79,6 +80,14 @@
     </div>
     <h2>گزارش زنده</h2>
     <pre id="log" class="log"></pre>
+  </section>
+
+  <section id="traffic" class="panel hidden">
+    <div class="toolbar">
+      <p class="muted" style="margin:0;flex:1">همین‌جا هر درخواستی که پنل به دیوار می‌زند دیده می‌شود. توکن‌ها سانسور می‌شوند.</p>
+      <button id="clear-traffic" type="button" class="ghost">پاک کردن</button>
+    </div>
+    <pre id="traffic-log" class="log traffic-log"></pre>
   </section>
 
   <section id="accounts" class="panel hidden">
