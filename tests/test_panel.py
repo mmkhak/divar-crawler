@@ -43,16 +43,23 @@ def test_job_streams_two_pages_and_exports(tmp_path):
         seen_bodies.append(body)
         return 200, pages.pop(0), ""
 
-    async def fetch_detail(token):
+    async def fetch_listing_info(token):
         parsed = parse_detail(token, detail)
         assert parsed["description"]
-        return 200, detail, ""
+        return {
+            "description": parsed["description"],
+            "subtitle": parsed.get("subtitle") or "",
+            "specs": parsed.get("specs") or {},
+            "needs_login": False,
+            "needs_captcha": False,
+            "error": None,
+        }
 
     with TestClient(app) as client:
         app.state.db.update_settings({"anon_rps": "20", "default_daily_cap": "50", "delay_min": "20", "delay_max": "40"})
         app.state.manager.refresh_rate()
         app.state.manager.client.search = search
-        app.state.manager.client.detail = fetch_detail
+        app.state.manager.browser.fetch_listing_info = fetch_listing_info
         created = client.post(
             "/api/jobs",
             json={
@@ -101,14 +108,21 @@ def test_pause_resume_persists(tmp_path):
             await asyncio.sleep(0.02)
         return 200, _page("cccc3333", False, 1), ""
 
-    async def fetch_detail(token):
-        return 404, None, ""
+    async def fetch_listing_info(token):
+        return {
+            "description": "",
+            "subtitle": "",
+            "specs": {},
+            "needs_login": False,
+            "needs_captcha": False,
+            "error": "empty",
+        }
 
     with TestClient(app) as client:
         app.state.db.update_settings({"anon_rps": "20", "default_daily_cap": "50", "delay_min": "5", "delay_max": "5"})
         app.state.manager.refresh_rate()
         app.state.manager.client.search = search
-        app.state.manager.client.detail = fetch_detail
+        app.state.manager.browser.fetch_listing_info = fetch_listing_info
         job_id = client.post("/api/jobs", json={"category": "beauty-and-haircare", "max_pages": 1, "fetch_details": False}).json()["id"]
         client.post(f"/api/jobs/{job_id}/start")
         time.sleep(0.1)
@@ -157,24 +171,20 @@ def test_confirm_saves_token_without_leaking_it(tmp_path):
 def test_fetch_phones_queues_even_without_details_flag(tmp_path):
     app = create_app(tmp_path)
     pages = [_page("phoneTok1", False, 1)]
-    detail = json.loads((FIX / "detail_sample.json").read_text(encoding="utf-8"))
     revealed = []
 
     async def search(body):
         return 200, pages.pop(0), ""
 
-    async def fetch_detail(token):
-        return 200, detail, ""
-
     async def reveal_phone(token):
         revealed.append(token)
-        return {"phones": ["09120000000"], "needs_login": False, "error": None}
-
-    async def send_report(*args, **kwargs):
-        return 204
-
-    async def send_post_detail_reports(*args, **kwargs):
-        return None
+        return {
+            "phones": ["09120000000"],
+            "needs_login": False,
+            "needs_captcha": False,
+            "error": None,
+            "description": "توضیح از صفحه",
+        }
 
     with TestClient(app) as client:
         app.state.db.update_settings(
@@ -182,9 +192,6 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         )
         app.state.manager.refresh_rate()
         app.state.manager.client.search = search
-        app.state.manager.client.detail = fetch_detail
-        app.state.manager.client.send_report = send_report
-        app.state.manager.client.send_post_detail_reports = send_post_detail_reports
         app.state.manager.browser.reveal_phone = reveal_phone
         created = client.post(
             "/api/jobs",
@@ -196,7 +203,7 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
             },
         )
         assert created.status_code == 200
-        assert created.json()["fetch_details"] is True
+        assert created.json()["fetch_details"] is False
         job_id = created.json()["id"]
         client.post(f"/api/jobs/{job_id}/start")
         status = "running"
@@ -209,6 +216,7 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         rows = client.get("/api/listings").json()
         assert rows[0]["phone"] == "09120000000"
         assert rows[0]["phone_status"] == "done"
+        assert rows[0]["description"] == "توضیح از صفحه"
         assert revealed == ["phoneTok1"]
 
 

@@ -218,7 +218,7 @@ class BrowserSession:
                     response_body = await response.text()
             except Exception as exc:
                 if await self._looks_like_captcha(page):
-                    return self._captcha_result(url, click_started)
+                    return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
                 if not clicked:
                     clicked = await self._click_contact(page)
                 if not clicked:
@@ -230,25 +230,27 @@ class BrowserSession:
                         "contact button missing",
                     )
                     if await self._looks_like_captcha(page):
-                        return self._captcha_result(url, click_started)
+                        return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
                     if await self._looks_like_login(page):
                         return {
                             "phones": [],
                             "needs_login": True,
                             "needs_captcha": False,
                             "error": "login required",
+                            "description": fields.get("description") or "",
                         }
                     return {
                         "phones": [],
                         "needs_login": False,
                         "needs_captcha": False,
                         "error": f"contact button not found ({exc})",
+                        "description": fields.get("description") or "",
                     }
                 await page.wait_for_timeout(2000)
                 response_body = await self._safe_text(page)
 
             if await self._looks_like_captcha(page):
-                return self._captcha_result(url, click_started)
+                return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
 
             if response_status == 401 or "LOGIN_REQUIRED" in (response_body or ""):
                 self.traffic.record(
@@ -263,13 +265,14 @@ class BrowserSession:
                     "needs_login": True,
                     "needs_captcha": False,
                     "error": "login required",
+                    "description": fields.get("description") or "",
                 }
 
             phones = phones_from_contact(response_body) if response_body else []
             if not phones:
                 await page.wait_for_timeout(1500)
                 if await self._looks_like_captcha(page):
-                    return self._captcha_result(url, click_started)
+                    return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
                 tels = await page.eval_on_selector_all(
                     'a[href^="tel:"]',
                     "els => els.map(e => e.getAttribute('href') || '')",
@@ -290,6 +293,7 @@ class BrowserSession:
                     "needs_login": True,
                     "needs_captcha": False,
                     "error": "login required",
+                    "description": fields.get("description") or "",
                 }
 
             self.traffic.record(
@@ -304,7 +308,69 @@ class BrowserSession:
                 "needs_login": False,
                 "needs_captcha": False,
                 "error": None if phones else "empty",
+                "description": fields.get("description") or "",
+                "subtitle": fields.get("subtitle") or "",
+                "specs": fields.get("specs") or {},
             }
+
+    async def _open_listing(self, token: str) -> dict[str, Any]:
+        await self.ensure()
+        assert self._page is not None
+        page = self._page
+        url = POST_URL.format(token=token)
+        started = time.monotonic()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            self.traffic.record(
+                "BROWSER",
+                url,
+                0,
+                int((time.monotonic() - started) * 1000),
+                f"open fail {exc}",
+            )
+            return {"error": str(exc)[:200]}
+        self.traffic.record(
+            "BROWSER",
+            url,
+            200,
+            int((time.monotonic() - started) * 1000),
+            f"open post {token}",
+        )
+        await self._dismiss_overlays(page)
+        if await self._looks_like_captcha(page):
+            return self._captcha_result(url, started)
+        if await self._looks_like_login(page):
+            return {"needs_login": True, "error": "login required"}
+        return {}
+
+    async def _scrape_listing_fields(self, page: Any) -> dict[str, Any]:
+        description = ""
+        selectors = [
+            '[class*="description-row"]',
+            '[class*="post-description"]',
+            'section:has-text("توضیحات")',
+            '[data-testid="description"]',
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0:
+                    continue
+                text = (await locator.inner_text(timeout=2000)).strip()
+                if text and text not in {"توضیحات", "Description"}:
+                    description = text
+                    break
+            except Exception:
+                continue
+        if not description:
+            try:
+                description = (
+                    await page.locator("meta[name='description']").get_attribute("content") or ""
+                ).strip()
+            except Exception:
+                description = ""
+        return {"description": description, "subtitle": "", "specs": {}}
 
     def _captcha_result(self, url: str, started: float) -> dict[str, Any]:
         self.begin_captcha()

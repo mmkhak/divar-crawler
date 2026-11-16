@@ -1,5 +1,5 @@
-"""Background crawl workers. Anonymous search/detail share one rate limiter;
-phone lookups use Playwright Chromium on the listing page.
+"""Background crawl workers. Search stays on the anonymous API;
+listing details and phones come from Playwright Chromium (no posts-v2 token API).
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from app.divar.parse import (
     canonical_phones,
     matches_keywords,
     pagination_state,
-    parse_detail,
     parse_search_rows,
     snippet,
 )
@@ -191,7 +190,7 @@ class JobManager:
                     "snippet": snippet(row["list_bottom"] or row["title"]),
                     "description": None,
                     "phone": None,
-                    "phone_status": "none",
+                    "phone_status": "pending" if job["fetch_phones"] else "none",
                     "link": f"https://divar.ir/v/{row['token']}",
                     "red_text": row["red_text"],
                     "found_by": label,
@@ -199,6 +198,9 @@ class JobManager:
                 saved, created = self.db.upsert_listing(job_id, record)
                 if created:
                     added += 1
+                    self.hub.publish("listing", _public_listing(saved, job["name"]))
+                elif job["fetch_phones"] and saved.get("phone_status") == "none":
+                    saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
                     self.hub.publish("listing", _public_listing(saved, job["name"]))
                 if _needs_detail(saved, job):
                     await self._fetch_detail(job_id, saved, job)
@@ -217,35 +219,37 @@ class JobManager:
             await self._drain_phones(job_id, limit=5)
 
     async def _fetch_detail(self, job_id: int, listing: dict[str, Any], job: dict[str, Any]) -> None:
+        """Scrape listing text from Chromium. Never calls posts-v2/{token}."""
         if not await self._wait_controls(job_id):
             return
-        await self.limiter.wait()
+        # Phones already open the same page; skip a second visit.
+        if job["fetch_phones"] and listing.get("phone_status") == "pending":
+            return
         try:
-            status, payload, _text = await self.client.detail(listing["token"])
+            outcome = await self.browser.fetch_listing_info(listing["token"])
         except Exception as exc:
-            self.limiter.backoff(8)
-            self._log(job_id, f"جزئیات {listing['token']}: {exc}", "warn")
+            self._log(job_id, f"جزئیات مرورگر {listing['token']}: {exc}", "warn")
             return
-        if status in {403, 429, 500, 502, 503}:
-            self.limiter.backoff(12 if status in {403, 429} else 6)
-            self._log(job_id, f"جزئیات کند شد ({status})؛ فاصله بیشتر", "warn")
+        if outcome.get("needs_captcha"):
+            self.hub.publish("captcha", self.browser.captcha_status())
+            self._log(job_id, "کپچا هنگام جزئیات — VNC را باز کن و بعد «کپچا حل شد» را بزن", "error")
+            await self.browser.wait_captcha_resolved()
+            self.hub.publish("captcha", self.browser.captcha_status())
+            await self._fetch_detail(job_id, listing, job)
             return
-        if status == 404 or payload is None:
-            self.db.update_listing(listing["id"], description="", phone_status="skipped")
+        if outcome.get("needs_login"):
+            self._log(job_id, "برای جزئیات باید Chromium لاگین باشد", "error")
             return
-        parsed = parse_detail(listing["token"], payload)
-        description = parsed["description"] or ""
-        if job["desc_filter"] and not matches_keywords(
-            description + " " + (parsed["subtitle"] or ""), job["desc_filter"]
-        ):
+        description = outcome.get("description") or ""
+        subtitle = outcome.get("subtitle") or ""
+        specs = outcome.get("specs") or {}
+        if job["desc_filter"] and not matches_keywords(description + " " + subtitle, job["desc_filter"]):
             updated = self.db.update_listing(
                 listing["id"],
                 description=description,
                 snippet=snippet(description or listing.get("snippet") or ""),
                 phone_status="skipped",
-                contact_uuid=parsed["contact_uuid"],
-                specs_json=json.dumps(parsed["specs"], ensure_ascii=False),
-                breadcrumb=" > ".join(part for part in parsed["breadcrumb"] if part),
+                specs_json=json.dumps(specs, ensure_ascii=False),
             )
             self.hub.publish("listing", _public_listing(updated, job["name"]))
             return
@@ -254,24 +258,22 @@ class JobManager:
                 part
                 for part in (
                     description,
-                    parsed.get("subtitle") or "",
-                    " ".join(str(v) for v in (parsed.get("specs") or {}).values()),
+                    subtitle,
+                    " ".join(str(v) for v in specs.values()),
                 )
                 if part
             )
         )
-        phone_status = "none"
-        if job["fetch_phones"]:
+        phone_status = listing.get("phone_status") or "none"
+        if job["fetch_phones"] and phone_status == "none":
             phone_status = "pending"
         updated = self.db.update_listing(
             listing["id"],
             description=description,
-            snippet=snippet(description or parsed["subtitle"] or listing.get("snippet") or ""),
-            contact_uuid=parsed["contact_uuid"],
+            snippet=snippet(description or subtitle or listing.get("snippet") or ""),
             phone="، ".join(found) if found else listing.get("phone"),
             phone_status=phone_status,
-            specs_json=json.dumps(parsed["specs"], ensure_ascii=False),
-            breadcrumb=" > ".join(part for part in parsed["breadcrumb"] if part),
+            specs_json=json.dumps(specs, ensure_ascii=False),
             price_text=listing.get("price_text") or "",
         )
         self.hub.publish("listing", _public_listing(updated, job["name"]))
@@ -320,13 +322,14 @@ class JobManager:
                 )
                 return
             phones = list(outcome.get("phones") or [])
+            description = outcome.get("description") or listing.get("description") or ""
             if not phones:
                 phones = canonical_phones(
                     " ".join(
                         part
                         for part in (
                             listing.get("phone") or "",
-                            listing.get("description") or "",
+                            description,
                             listing.get("snippet") or "",
                             listing.get("specs_json") or "",
                         )
@@ -335,7 +338,13 @@ class JobManager:
                 )
             joined = "، ".join(phones)
             phone_status = "done" if phones else "empty"
-            updated = self.db.update_listing(listing["id"], phone=joined, phone_status=phone_status)
+            updates: dict[str, Any] = {"phone": joined, "phone_status": phone_status}
+            if description and not listing.get("description"):
+                updates["description"] = description
+                updates["snippet"] = snippet(description or listing.get("snippet") or "")
+            if outcome.get("specs"):
+                updates["specs_json"] = json.dumps(outcome["specs"], ensure_ascii=False)
+            updated = self.db.update_listing(listing["id"], **updates)
             if phones:
                 self._log(job_id, f"شماره {listing['token']}: {joined}")
             else:
@@ -346,13 +355,14 @@ class JobManager:
 
 
 def _needs_detail(listing: dict[str, Any], job: dict[str, Any]) -> bool:
-    if listing.get("phone_status") in {"done", "empty", "skipped"}:
-        return job["fetch_details"] and listing.get("description") is None
-    if job["fetch_phones"] and listing.get("phone_status") != "pending":
-        return True
-    if listing.get("phone_status") == "pending":
+    if not job["fetch_details"]:
         return False
-    return bool(job["fetch_details"]) and listing.get("description") is None
+    if listing.get("description") is not None:
+        return False
+    # Phone drain opens the same page and fills description there.
+    if job["fetch_phones"] and listing.get("phone_status") == "pending":
+        return False
+    return True
 
 
 def _public_listing(row: dict[str, Any], job_name: str) -> dict[str, Any]:

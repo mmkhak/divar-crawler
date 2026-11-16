@@ -156,12 +156,6 @@ $("#clear-traffic").addEventListener("click", async () => {
   $("#traffic-log").textContent = "";
 });
 
-$("#fetch-phones").addEventListener("change", (event) => {
-  if (event.target.checked) {
-    document.querySelector('input[name="fetch_details"]').checked = true;
-  }
-});
-
 $("#job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.target);
@@ -175,7 +169,7 @@ $("#job-form").addEventListener("submit", async (event) => {
     desc_filter: [form.get("desc_filter")].filter(Boolean),
     max_pages: Number(form.get("max_pages") || 2),
     fetch_phones: form.get("fetch_phones") === "on",
-    fetch_details: form.get("fetch_details") === "on" || form.get("fetch_phones") === "on",
+    fetch_details: form.get("fetch_details") === "on",
   };
   try {
     await api("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
