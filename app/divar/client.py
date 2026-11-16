@@ -75,6 +75,7 @@ class DivarClient:
             "timeout": self.timeout,
             "headers": browser_headers(listing_token=listing_token),
             "cookies": session_cookies(self._did, auth_token),
+            "trust_env": False,
         }
         if proxy:
             kwargs["proxy"] = proxy

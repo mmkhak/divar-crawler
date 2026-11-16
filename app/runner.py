@@ -1,19 +1,19 @@
 """Background crawl workers. Anonymous search/detail share one rate limiter;
-phone lookups are round-robin across accounts, each with its own delay.
+phone lookups use Playwright Chromium on the listing page.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
-from app.accounts import AccountView, pick_account
 from app.catalog import load_cities
-from app.db import Database, today_key
+from app.db import Database
+from app.divar.browser import BrowserSession
 from app.divar.client import DivarClient, RateLimiter, build_search, jitter
 from app.divar.parse import (
     canonical_phones,
-    classify_contact,
     matches_keywords,
     pagination_state,
     parse_detail,
@@ -31,18 +31,18 @@ class JobManager:
         hub: EventHub,
         data_dir: Any,
         traffic: TrafficBuffer | None = None,
+        browser: BrowserSession | None = None,
     ) -> None:
         self.db = db
         self.hub = hub
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
         self.traffic = traffic or TrafficBuffer()
         self.client = DivarClient(traffic=self.traffic)
+        self.browser = browser or BrowserSession(self.data_dir / "chrome-profile", self.traffic)
         self.limiter = RateLimiter(float(db.setting("anon_rps") or 1))
         self._tasks: dict[int, asyncio.Task] = {}
         self._pause: dict[int, asyncio.Event] = {}
         self._stop: dict[int, asyncio.Event] = {}
-        self._rr = 0
-        self._account_lock = asyncio.Lock()
 
     def refresh_rate(self) -> None:
         self.limiter.set_rps(float(self.db.setting("anon_rps") or 1))
@@ -288,46 +288,26 @@ class JobManager:
             if not pending:
                 return
             listing = pending[0]
-            account = await self._next_account()
-            if account is None:
-                self._log(job_id, "هیچ حساب آماده‌ای برای شماره نیست", "warn")
-                return
-            wait = jitter(float(account["delay_min"]), float(account["delay_max"]))
-            self._log(job_id, f"شماره با حساب {account['phone']} پس از {wait:.0f} ثانیه")
+            delay_min = float(self.db.setting("delay_min") or 20)
+            delay_max = float(self.db.setting("delay_max") or 40)
+            wait = jitter(delay_min, delay_max)
+            self._log(job_id, f"شماره با Chromium پس از {wait:.0f} ثانیه · {listing['token']}")
             await asyncio.sleep(wait)
             if not await self._wait_controls(job_id):
                 return
             try:
-                status, text = await self.client.contact(
-                    listing["token"],
-                    account["token"],
-                    listing.get("contact_uuid"),
-                    account.get("proxy"),
-                )
+                outcome = await self.browser.reveal_phone(listing["token"])
             except Exception as exc:
-                self._log(job_id, f"خطای شماره: {exc}", "warn")
+                self._log(job_id, f"خطای شماره مرورگر: {exc}", "warn")
                 return
-            outcome = classify_contact(status, text)
-            kind = outcome["kind"]
-            if kind == "expired":
-                self.db.update_account(account["id"], status="expired", last_error="401")
-                self._log(job_id, f"حساب {account['phone']} منقضی شد؛ دوباره وارد شوید", "error")
-                self.hub.publish("account", {"id": account["id"], "status": "expired"})
-                continue
-            if kind == "limited":
-                self.db.update_account(
-                    account["id"],
-                    status="limited",
-                    views_day=today_key(),
-                    last_error=(outcome.get("detail") or "")[:180],
+            if outcome.get("needs_login"):
+                self._log(
+                    job_id,
+                    "نشست Chromium لاگین نیست؛ از برگه حساب‌ها «باز کردن کروم برای لاگین» را بزنید",
+                    "error",
                 )
-                self._log(job_id, f"حساب {account['phone']} برای امروز محدود شد", "warn")
-                self.hub.publish("account", {"id": account["id"], "status": "limited"})
-                continue
-            if kind == "retry":
-                self._log(job_id, f"پاسخ شماره {status}؛ بعداً دوباره", "warn")
                 return
-            phones = list(outcome["phones"])
+            phones = list(outcome.get("phones") or [])
             if not phones:
                 phones = canonical_phones(
                     " ".join(
@@ -347,36 +327,10 @@ class JobManager:
             if phones:
                 self._log(job_id, f"شماره {listing['token']}: {joined}")
             else:
-                self._log(job_id, f"شماره‌ای برای {listing['token']} نبود")
-            self.db.update_account(
-                account["id"],
-                views_today=int(account["views_today"]) + 1,
-                views_day=today_key(),
-                last_used_at=updated["created_at"],
-                status="active",
-            )
+                detail = outcome.get("error") or "خالی"
+                self._log(job_id, f"شماره‌ای برای {listing['token']} نبود ({detail})", "warn")
             self.hub.publish("listing", _public_listing(updated, job["name"]))
             handled += 1
-
-    async def _next_account(self) -> dict[str, Any] | None:
-        async with self._account_lock:
-            secrets = self.db.account_secrets()
-            views = [
-                AccountView(
-                    id=row["id"],
-                    status=row["status"],
-                    views_today=row["views_today"],
-                    daily_cap=row["daily_cap"],
-                    views_day=row["views_day"],
-                    delay_min=row["delay_min"],
-                    delay_max=row["delay_max"],
-                )
-                for row in secrets
-            ]
-            chosen, self._rr = pick_account(views, self._rr, today_key())
-            if not chosen:
-                return None
-            return next(row for row in secrets if row["id"] == chosen.id)
 
 
 def _needs_detail(listing: dict[str, Any], job: dict[str, Any]) -> bool:

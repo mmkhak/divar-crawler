@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.catalog import load_categories, load_cities, refresh_cities, search_cities
 from app.db import Database
+from app.divar.browser import BrowserSession
 from app.divar.client import DivarClient
 from app.divar.parse import FA_DIGITS, extract_token, normalize_phone_input
 from app.divar.traffic import TrafficBuffer
@@ -21,7 +23,7 @@ from app.runner import JobManager, city_name
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
-DATA = Path(ROOT / "data")
+DATA = Path(os.environ.get("DATA_DIR", ROOT / "data"))
 
 
 class JobIn(BaseModel):
@@ -74,7 +76,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     hub = EventHub()
     traffic = TrafficBuffer()
     traffic.on_entry(lambda entry: hub.publish("traffic", entry))
-    manager = JobManager(db, hub, data, traffic=traffic)
+    browser = BrowserSession(data / "chrome-profile", traffic)
+    manager = JobManager(db, hub, data, traffic=traffic, browser=browser)
     auth_client = DivarClient(traffic=traffic)
     app = FastAPI(title="پنل دیوار")
     app.state.db = db
@@ -82,6 +85,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     app.state.data = data
     app.state.auth = auth_client
     app.state.traffic = traffic
+    app.state.browser = browser
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -208,6 +212,17 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     async def clear_traffic() -> dict[str, bool]:
         app.state.traffic.clear()
         return {"ok": True}
+
+    @app.post("/api/browser/open-login")
+    async def open_browser_login() -> dict[str, Any]:
+        try:
+            await app.state.browser.open_login()
+        except Exception as exc:
+            raise HTTPException(500, f"باز کردن Chromium ناموفق بود: {exc}") from exc
+        return {
+            "ok": True,
+            "message": "پنجره Chromium باز شد. یک‌بار در همان پنجره وارد دیوار شوید.",
+        }
 
     @app.get("/api/events")
     async def events() -> StreamingResponse:

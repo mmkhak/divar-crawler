@@ -91,9 +91,16 @@
   </section>
 
   <section id="accounts" class="panel hidden">
+    <div class="card">
+      <h2>لاگین Chromium برای شماره</h2>
+      <p class="muted">شماره آگهی با Playwright/Chromium از صفحه آگهی خوانده می‌شود. نشست در <code dir="ltr">data/chrome-profile</code> می‌ماند.</p>
+      <p class="muted">روی سرور/Coolify: اول noVNC را باز کن (پورت <code dir="ltr">6080</code>)، بعد این دکمه را بزن و داخل همان دسکتاپ مجازی وارد دیوار شو.</p>
+      <button type="button" id="open-browser-login">باز کردن کروم برای لاگین</button>
+      <p id="browser-msg" class="muted"></p>
+    </div>
     <form id="account-form" class="card">
-      <h2>افزودن حساب دیوار</h2>
-      <p class="muted">کد پیامک را خودتان اینجا وارد می‌کنید. هیچ پیامی از طرف پنل به کسی فرستاده نمی‌شود جز درخواست کد برای همین شماره.</p>
+      <h2>افزودن حساب دیوار (اختیاری / قدیمی)</h2>
+      <p class="muted">کد پیامک را خودتان اینجا وارد می‌کنید. برای گرفتن شماره دیگر لازم نیست؛ مسیر اصلی Chromium است.</p>
       <div class="row">
         <label>موبایل <input name="phone" placeholder="0912…" dir="ltr" required /></label>
         <label>پروکسی (اختیاری) <input name="proxy" placeholder="http://127.0.0.1:8080" dir="ltr" /></label>

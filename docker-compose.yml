@@ -1,0 +1,18 @@
+services:
+  panel:
+    build: .
+    ports:
+      - "8000:8000"   # پنل
+      - "6080:6080"   # noVNC برای لاگین Chromium
+    environment:
+      ENABLE_VNC: "1"
+      BROWSER_HEADLESS: "0"
+      DISPLAY: ":99"
+      DATA_DIR: /app/data
+      PORT: "8000"
+    volumes:
+      - divar-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  divar-data:

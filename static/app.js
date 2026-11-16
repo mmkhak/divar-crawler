@@ -200,6 +200,16 @@ $("#account-list").addEventListener("click", async (event) => {
   renderAccounts(await api("/api/accounts"));
 });
 
+$("#open-browser-login").addEventListener("click", async () => {
+  $("#browser-msg").textContent = "در حال باز کردن Chromium…";
+  try {
+    const result = await api("/api/browser/open-login", { method: "POST" });
+    $("#browser-msg").textContent = result.message || "باز شد.";
+  } catch (err) {
+    $("#browser-msg").textContent = err.message;
+  }
+});
+
 $("#send-code").addEventListener("click", async () => {
   const form = new FormData($("#account-form"));
   $("#account-msg").textContent = "در حال درخواست کد…";

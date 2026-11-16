@@ -158,7 +158,7 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
     app = create_app(tmp_path)
     pages = [_page("phoneTok1", False, 1)]
     detail = json.loads((FIX / "detail_sample.json").read_text(encoding="utf-8"))
-    contacts = []
+    revealed = []
 
     async def search(body):
         return 200, pages.pop(0), ""
@@ -166,9 +166,9 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
     async def fetch_detail(token):
         return 200, detail, ""
 
-    async def contact(token, auth_token, contact_uuid, proxy=None):
-        contacts.append((token, auth_token, contact_uuid))
-        return 200, '{"widget_list":[{"text":"09120000000"}]}'
+    async def reveal_phone(token):
+        revealed.append(token)
+        return {"phones": ["09120000000"], "needs_login": False, "error": None}
 
     async def send_report(*args, **kwargs):
         return 204
@@ -178,23 +178,14 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
 
     with TestClient(app) as client:
         app.state.db.update_settings(
-            {"anon_rps": "20", "default_daily_cap": "50", "delay_min": "0", "delay_max": "0"}
+            {"anon_rps": "20", "default_daily_cap": "50", "delay_min": "0.01", "delay_max": "0.01"}
         )
         app.state.manager.refresh_rate()
         app.state.manager.client.search = search
         app.state.manager.client.detail = fetch_detail
-        app.state.manager.client.contact = contact
         app.state.manager.client.send_report = send_report
         app.state.manager.client.send_post_detail_reports = send_post_detail_reports
-        app.state.db.add_account(
-            {
-                "phone": "09120000000",
-                "token": "acct-token",
-                "daily_cap": 10,
-                "delay_min": 0.01,
-                "delay_max": 0.01,
-            }
-        )
+        app.state.manager.browser.reveal_phone = reveal_phone
         created = client.post(
             "/api/jobs",
             json={
@@ -218,4 +209,19 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         rows = client.get("/api/listings").json()
         assert rows[0]["phone"] == "09120000000"
         assert rows[0]["phone_status"] == "done"
-        assert contacts and contacts[0][0] == "phoneTok1"
+        assert revealed == ["phoneTok1"]
+
+
+def test_open_browser_login_endpoint(tmp_path):
+    app = create_app(tmp_path)
+    called = []
+
+    async def open_login():
+        called.append(True)
+
+    app.state.browser.open_login = open_login
+    with TestClient(app) as client:
+        result = client.post("/api/browser/open-login")
+        assert result.status_code == 200
+        assert result.json()["ok"] is True
+        assert called
