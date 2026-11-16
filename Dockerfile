@@ -33,7 +33,7 @@ COPY run.py .
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
-RUN mkdir -p /app/data/chrome-profile
+RUN mkdir -p /app/data/chrome-profiles /app/data/chrome-profile
 
 EXPOSE 8000 6080
 

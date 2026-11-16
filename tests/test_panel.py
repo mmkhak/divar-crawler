@@ -232,8 +232,8 @@ def test_browser_accounts_crud_and_captcha(tmp_path):
     app = create_app(tmp_path)
     opened = []
 
-    async def open_login():
-        opened.append(True)
+    async def open_login(label=""):
+        opened.append(label or True)
 
     async def verify_login():
         return {"logged_in": True, "phone": "09123334444", "needs_captcha": False}

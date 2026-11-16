@@ -12,7 +12,10 @@ docker compose up --build -d
 ## Coolify
 
 1. New Resource → Docker Compose (همین ریپو، فایل `docker-compose.yml`).
-2. Volume `divar-data` را نگه دار تا دیتابیس و `chrome-profile` پاک نشوند.
+2. Volume لازم است: مسیر کانتینر `/app/data` را به یک Persistent Volume وصل کن
+   (در `docker-compose.yml` همان `divar-data:/app/data` است).
+   داخلش می‌ماند: `panel.db` + `chrome-profiles/` (لاگین هر اکانت).
+   بدون volume بعد از هر deploy دوباره باید لاگین کنی.
 3. دو پورت را publish کن:
    - `8000` → دامنه پنل (مثلاً `https://divar.example.com`)
    - `6080` → دامنه noVNC (مثلاً `https://vnc.example.com`) یا فقط IP:6080

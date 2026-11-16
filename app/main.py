@@ -253,16 +253,20 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         account = db.get_browser_account(account_id)
         if not account:
             raise HTTPException(404, "اکانت پیدا نشد")
+        label = account.get("label") or f"اکانت {account_id}"
         try:
-            await browsers.get(account_id).open_login()
+            # Close other profiles first — otherwise VNC still shows the previous Chromium.
+            session = await browsers.focus(account_id)
+            await session.open_login(label=str(label))
         except Exception as exc:
             raise HTTPException(500, f"باز کردن Chromium ناموفق بود: {exc}") from exc
         db.update_browser_account(account_id, status="needs_login", last_error=None)
         return {
             "ok": True,
-            "message": "Chromium این اکانت باز شد. در VNC وارد دیوار شو، بعد «تأیید اتصال» را بزن.",
+            "message": f"Chromium اکانت «{label}» باز شد (پنجره‌های دیگر بسته شد). در VNC وارد شو، بعد تأیید اتصال.",
             "vnc_url": browsers.vnc_url,
             "account": db.get_browser_account(account_id),
+            "profile_dir": str(browsers.profile_dir(account_id)),
         }
 
     @app.post("/api/browser-accounts/{account_id}/verify")
@@ -271,7 +275,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if not account:
             raise HTTPException(404, "اکانت پیدا نشد")
         try:
-            result = await browsers.get(account_id).verify_login()
+            session = await browsers.focus(account_id)
+            result = await session.verify_login()
         except Exception as exc:
             raise HTTPException(500, f"بررسی لاگین ناموفق بود: {exc}") from exc
         if result.get("needs_captcha"):

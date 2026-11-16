@@ -16,6 +16,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def clear_profile_locks(profile_dir: Path) -> None:
+    """Remove stale Chromium singleton locks left after container restart."""
+    profile_dir = Path(profile_dir)
+    if not profile_dir.exists():
+        return
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = profile_dir / name
+        try:
+            if path.is_symlink() or path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
 LOGIN_URL = "https://divar.ir/my-divar"
 POST_URL = "https://divar.ir/v/{token}"
 CONTACT_HINT = ("contact_info", "postcontact")
@@ -92,16 +106,43 @@ class BrowserSession:
         from playwright.async_api import async_playwright
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        self._playwright = await async_playwright().start()
+        clear_profile_locks(self.profile_dir)
         headless = _env_bool("BROWSER_HEADLESS", False)
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
-            headless=headless,
-            viewport={"width": 1365, "height": 900},
-            locale="fa-IR",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                if self._playwright is None:
+                    self._playwright = await async_playwright().start()
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(self.profile_dir),
+                    headless=headless,
+                    viewport={"width": 1365, "height": 900},
+                    locale="fa-IR",
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                self._page = (
+                    self._context.pages[0]
+                    if self._context.pages
+                    else await self._context.new_page()
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                self._context = None
+                self._page = None
+                # Stale lock from previous container — clear and retry once.
+                clear_profile_locks(self.profile_dir)
+                if attempt == 0 and "profile appears to be in use" in str(exc).lower():
+                    continue
+                if self._playwright is not None:
+                    try:
+                        await self._playwright.stop()
+                    except Exception:
+                        pass
+                    self._playwright = None
+                raise
+        if last_error:
+            raise last_error
 
     async def close(self) -> None:
         async with self._get_lock():
@@ -113,18 +154,19 @@ class BrowserSession:
             self._playwright = None
             self._page = None
 
-    async def open_login(self) -> None:
+    async def open_login(self, label: str = "") -> None:
         async with self._get_lock():
             await self.ensure()
             assert self._page is not None
             started = time.monotonic()
             await self._page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            await self._mark_account_window(label or self.profile_dir.name)
             self.traffic.record(
                 "BROWSER",
                 LOGIN_URL,
                 200,
                 int((time.monotonic() - started) * 1000),
-                "open login",
+                f"open login profile={self.profile_dir.name}",
             )
 
     async def verify_login(self) -> dict[str, Any]:
@@ -500,6 +542,30 @@ class BrowserSession:
         except Exception:
             return ""
 
+    async def _mark_account_window(self, label: str) -> None:
+        """Show which profile is on screen so VNC login is not ambiguous."""
+        if self._page is None:
+            return
+        safe = (label or "").replace("\\", "\\\\").replace("'", "\\'")[:80]
+        try:
+            await self._page.evaluate(
+                f"""() => {{
+                  document.title = 'اکانت: {safe}';
+                  let bar = document.getElementById('divar-crawler-account-bar');
+                  if (!bar) {{
+                    bar = document.createElement('div');
+                    bar.id = 'divar-crawler-account-bar';
+                    bar.style.cssText = 'position:fixed;z-index:2147483647;top:0;left:0;right:0;'
+                      + 'padding:10px 14px;background:#9b2335;color:#fff;font:16px Tahoma,sans-serif;'
+                      + 'text-align:center';
+                    document.documentElement.appendChild(bar);
+                  }}
+                  bar.textContent = 'در حال لاگین اکانت: {safe}';
+                }}"""
+            )
+        except Exception:
+            pass
+
 
 class BrowserPool:
     """One persistent Chromium profile per browser account id."""
@@ -515,11 +581,20 @@ class BrowserPool:
         return self.root / str(account_id)
 
     def get(self, account_id: int) -> BrowserSession:
+        account_id = int(account_id)
         session = self._sessions.get(account_id)
         if session is None:
             session = BrowserSession(self.profile_dir(account_id), self.traffic)
             self._sessions[account_id] = session
         return session
+
+    async def focus(self, account_id: int) -> BrowserSession:
+        """Close other Chromiums so VNC only shows this account's window."""
+        account_id = int(account_id)
+        for other_id in list(self._sessions):
+            if other_id != account_id:
+                await self.close(other_id)
+        return self.get(account_id)
 
     def captcha_status(self) -> dict[str, Any]:
         active = any(session.captcha_active for session in self._sessions.values())

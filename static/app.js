@@ -113,7 +113,7 @@ function renderBrowserAccounts(list) {
       </div>
       <div class="row">
         <a class="button-link" href="https://divar2.pixlink.ir/vnc.html" target="_blank" rel="noopener">VNC</a>
-        <button type="button" data-login="${account.id}">لاگین در کروم</button>
+        <button type="button" data-login="${account.id}">لاگین این اکانت</button>
         <button type="button" data-verify="${account.id}">تأیید اتصال</button>
         <button class="ghost" type="button" data-del="${account.id}">حذف</button>
       </div>

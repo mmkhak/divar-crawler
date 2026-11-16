@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.accounts import account_view_from_row, pick_account
+from app.accounts import AccountView, account_view_from_row, available
 from app.catalog import load_cities
 from app.db import Database, today_key
 from app.divar.browser import BrowserPool
@@ -292,13 +292,24 @@ class JobManager:
         )
         self.hub.publish("listing", _public_listing(updated, job["name"]))
 
-    def _pick_browser_account(self):
-        rows = self.db.list_browser_accounts()
-        views = [account_view_from_row(row) for row in rows]
-        picked, self._account_cursor = pick_account(views, self._account_cursor, today_key())
-        return picked
+    def _active_browser_accounts(self) -> list[AccountView]:
+        today = today_key()
+        return [
+            view
+            for view in (account_view_from_row(row) for row in self.db.list_browser_accounts())
+            if available(view, today)
+        ]
+
+    def _pick_browser_account(self) -> AccountView | None:
+        accounts = self._active_browser_accounts()
+        if not accounts:
+            return None
+        index = self._account_cursor % len(accounts)
+        self._account_cursor = (index + 1) % len(accounts)
+        return accounts[index]
 
     async def _drain_phones(self, job_id: int, limit: int | None = None) -> None:
+        """Reveal phones with all active Chromium accounts in parallel."""
         job = self.db.get_job(job_id)
         if not job or not job["fetch_phones"]:
             return
@@ -306,87 +317,136 @@ class JobManager:
         while limit is None or handled < limit:
             if not await self._wait_controls(job_id):
                 return
-            pending = self.db.pending_phones(job_id, limit=1)
-            if not pending:
-                return
-            listing = pending[0]
-            account = self._pick_browser_account()
-            if account is None:
+            accounts = self._active_browser_accounts()
+            if not accounts:
                 self._log(
                     job_id,
                     "هیچ اکانت Chromium فعالی نیست؛ از برگه حساب‌ها چند اکانت وصل کنید",
                     "error",
                 )
                 return
-            row = self.db.get_browser_account(account.id) or {}
-            delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
-            delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
-            wait = jitter(delay_min, delay_max)
-            label = row.get("phone") or row.get("label") or f"#{account.id}"
+            batch = len(accounts)
+            if limit is not None:
+                batch = min(batch, limit - handled)
+            pending = self.db.pending_phones(job_id, limit=batch)
+            if not pending:
+                return
+            pairs: list[tuple[dict[str, Any], AccountView]] = []
+            for offset, listing in enumerate(pending):
+                account = accounts[(self._account_cursor + offset) % len(accounts)]
+                pairs.append((listing, account))
+            self._account_cursor = (self._account_cursor + len(pairs)) % len(accounts)
+            labels = [
+                (self.db.get_browser_account(account.id) or {}).get("phone")
+                or (self.db.get_browser_account(account.id) or {}).get("label")
+                or f"#{account.id}"
+                for _, account in pairs
+            ]
             self._log(
                 job_id,
-                f"شماره با اکانت {label} پس از {wait:.0f} ثانیه · {listing['token']}",
+                f"دریافت همزمان شماره با {len(pairs)} اکانت: {'، '.join(str(x) for x in labels)}",
             )
-            await asyncio.sleep(wait)
-            if not await self._wait_controls(job_id):
-                return
-            session = self.browsers.get(account.id)
-            try:
-                outcome = await session.reveal_phone(listing["token"])
-            except Exception as exc:
-                self._log(job_id, f"خطای شماره مرورگر ({label}): {exc}", "warn")
-                return
-            if outcome.get("needs_captcha"):
-                self.hub.publish("captcha", self.browsers.note_captcha(account.id))
-                self._log(
-                    job_id,
-                    f"کپچا روی اکانت {label} — VNC را باز کن، حل کن، بعد «کپچا حل شد» را بزن",
-                    "error",
-                )
-                await self.browsers.wait_captcha_resolved()
-                self.hub.publish("captcha", self.browsers.captcha_status())
-                self._log(job_id, "کپچا رفع شد؛ ادامه دریافت شماره")
-                continue
-            if outcome.get("needs_login"):
-                self.db.update_browser_account(
-                    account.id, status="needs_login", last_error="login required"
-                )
-                self.hub.publish("browser_account", self.db.get_browser_account(account.id))
-                self._log(job_id, f"اکانت {label} لاگین نیست؛ اکانت بعدی را امتحان می‌کنم", "warn")
-                continue
-            phones = list(outcome.get("phones") or [])
-            description = outcome.get("description") or listing.get("description") or ""
-            if not phones:
-                phones = canonical_phones(
-                    " ".join(
-                        part
-                        for part in (
-                            listing.get("phone") or "",
-                            description,
-                            listing.get("snippet") or "",
-                            listing.get("specs_json") or "",
-                        )
-                        if part
-                    )
-                )
-            joined = "، ".join(phones)
-            phone_status = "done" if phones else "empty"
-            updates: dict[str, Any] = {"phone": joined, "phone_status": phone_status}
-            if description and not listing.get("description"):
-                updates["description"] = description
-                updates["snippet"] = snippet(description or listing.get("snippet") or "")
-            if outcome.get("specs"):
-                updates["specs_json"] = json.dumps(outcome["specs"], ensure_ascii=False)
-            updated = self.db.update_listing(listing["id"], **updates)
-            self.db.bump_browser_account_view(account.id)
+            results = await asyncio.gather(
+                *[
+                    self._fetch_phone_with_account(job_id, listing, account)
+                    for listing, account in pairs
+                ],
+                return_exceptions=True,
+            )
+            progressed = 0
+            for result in results:
+                if isinstance(result, Exception):
+                    self._log(job_id, f"خطای موازی شماره: {result}", "warn")
+                    continue
+                if result == "stop":
+                    return
+                if result in {"done", "empty"}:
+                    progressed += 1
+            if progressed == 0:
+                # Avoid tight loop when every worker only hit login/captcha retry.
+                await asyncio.sleep(1)
+                if limit is not None and handled == 0:
+                    # still allow captcha retries without burning the outer limit forever
+                    continue
+            handled += progressed
+
+    async def _fetch_phone_with_account(
+        self,
+        job_id: int,
+        listing: dict[str, Any],
+        account: AccountView,
+    ) -> str:
+        row = self.db.get_browser_account(account.id) or {}
+        delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
+        delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
+        wait = jitter(delay_min, delay_max)
+        label = row.get("phone") or row.get("label") or f"#{account.id}"
+        self._log(
+            job_id,
+            f"شماره با اکانت {label} پس از {wait:.0f} ثانیه · {listing['token']}",
+        )
+        await asyncio.sleep(wait)
+        if not await self._wait_controls(job_id):
+            return "stop"
+        # Keep other accounts open — parallel use needs all profiles alive.
+        session = self.browsers.get(account.id)
+        try:
+            outcome = await session.reveal_phone(listing["token"])
+        except Exception as exc:
+            self._log(job_id, f"خطای شماره مرورگر ({label}): {exc}", "warn")
+            return "error"
+        if outcome.get("needs_captcha"):
+            self.hub.publish("captcha", self.browsers.note_captcha(account.id))
+            self._log(
+                job_id,
+                f"کپچا روی اکانت {label} — VNC را باز کن، حل کن، بعد «کپچا حل شد» را بزن",
+                "error",
+            )
+            await session.wait_captcha_resolved()
+            self.hub.publish("captcha", self.browsers.captcha_status())
+            self._log(job_id, f"کپچا اکانت {label} رفع شد")
+            return "retry"
+        if outcome.get("needs_login"):
+            self.db.update_browser_account(
+                account.id, status="needs_login", last_error="login required"
+            )
             self.hub.publish("browser_account", self.db.get_browser_account(account.id))
-            if phones:
-                self._log(job_id, f"شماره {listing['token']}: {joined} · اکانت {label}")
-            else:
-                detail = outcome.get("error") or "خالی"
-                self._log(job_id, f"شماره‌ای برای {listing['token']} نبود ({detail})", "warn")
-            self.hub.publish("listing", _public_listing(updated, job["name"]))
-            handled += 1
+            self._log(job_id, f"اکانت {label} لاگین نیست", "warn")
+            return "retry"
+        phones = list(outcome.get("phones") or [])
+        description = outcome.get("description") or listing.get("description") or ""
+        if not phones:
+            phones = canonical_phones(
+                " ".join(
+                    part
+                    for part in (
+                        listing.get("phone") or "",
+                        description,
+                        listing.get("snippet") or "",
+                        listing.get("specs_json") or "",
+                    )
+                    if part
+                )
+            )
+        joined = "، ".join(phones)
+        phone_status = "done" if phones else "empty"
+        updates: dict[str, Any] = {"phone": joined, "phone_status": phone_status}
+        if description and not listing.get("description"):
+            updates["description"] = description
+            updates["snippet"] = snippet(description or listing.get("snippet") or "")
+        if outcome.get("specs"):
+            updates["specs_json"] = json.dumps(outcome["specs"], ensure_ascii=False)
+        updated = self.db.update_listing(listing["id"], **updates)
+        self.db.bump_browser_account_view(account.id)
+        self.hub.publish("browser_account", self.db.get_browser_account(account.id))
+        if phones:
+            self._log(job_id, f"شماره {listing['token']}: {joined} · اکانت {label}")
+        else:
+            detail = outcome.get("error") or "خالی"
+            self._log(job_id, f"شماره‌ای برای {listing['token']} نبود ({detail})", "warn")
+        job = self.db.get_job(job_id)
+        self.hub.publish("listing", _public_listing(updated, (job or {}).get("name") or ""))
+        return phone_status
 
 
 def _needs_detail(listing: dict[str, Any], job: dict[str, Any]) -> bool:
