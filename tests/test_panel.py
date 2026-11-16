@@ -228,6 +228,40 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         assert revealed == ["phoneTok1"]
 
 
+def test_create_job_from_divar_url(tmp_path):
+    app = create_app(tmp_path)
+
+    async def fetch_html(url):
+        assert "beauty-services" in url
+        html = """
+        <script>window.__PRELOADED_STATE__ = {
+          "search": {"searchData": {"formData": {"category": {"str": {"value": "beauty-and-haircare"}}}}},
+          "multiCity": {"selectedCities": [{"id": 715, "name": "کل ایران", "slug": "iran"}]}
+        };</script>
+        """
+        return 200, html
+
+    app.state.auth.fetch_html = fetch_html
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs/from-url",
+            json={
+                "url": "https://divar.ir/s/iran/beauty-services",
+                "fetch_phones": True,
+                "fetch_details": False,
+                "max_pages": 2,
+                "start": False,
+            },
+        )
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert body["category"] == "beauty-and-haircare"
+        assert body["city_id"] == "715"
+        assert body["city_name"] == "کل ایران"
+        assert body["fetch_phones"] is True
+        assert body["status"] == "paused"
+
+
 def test_browser_accounts_crud_and_captcha(tmp_path):
     app = create_app(tmp_path)
     opened = []

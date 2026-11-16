@@ -196,6 +196,13 @@ class DivarClient:
                 return response.status_code, None
             return 200, response.json()
 
+    async def fetch_html(self, url: str) -> tuple[int, str]:
+        started = time.monotonic()
+        async with self._client() as client:
+            response = await client.get(url, follow_redirects=True)
+            self._trace("GET", url, response.status_code, started, "html page")
+            return response.status_code, response.text
+
 
 def _report_note(payload: dict[str, Any]) -> str:
     reports = payload.get("reports") or []

@@ -179,6 +179,31 @@ $("#clear-traffic").addEventListener("click", async () => {
   $("#traffic-log").textContent = "";
 });
 
+$("#url-job-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.target);
+  const msg = $("#url-job-msg");
+  msg.textContent = "در حال خواندن لینک و ساخت کار…";
+  try {
+    const job = await api("/api/jobs/from-url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: form.get("url"),
+        name: form.get("name"),
+        max_pages: Number(form.get("max_pages") || 5),
+        fetch_phones: form.get("fetch_phones") === "on",
+        fetch_details: form.get("fetch_details") === "on",
+        start: true,
+      }),
+    });
+    msg.textContent = `شروع شد: ${job.name} · ${job.city_name} · ${job.category}`;
+    await refreshJobs();
+  } catch (err) {
+    msg.textContent = err.message;
+  }
+});
+
 $("#job-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.target);

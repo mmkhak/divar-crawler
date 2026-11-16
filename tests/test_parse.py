@@ -101,6 +101,31 @@ def test_auth_token_and_phone_normalize():
     assert not matches_keywords("املاک", ["آرایشگاه"])
 
 
+def test_parse_divar_search_url_and_aliases():
+    from app.divar.urls import (
+        extract_search_from_preloaded,
+        parse_divar_search_url,
+        resolve_category_slug,
+        resolve_city_slug,
+    )
+
+    parsed = parse_divar_search_url("https://divar.ir/s/iran/beauty-services")
+    assert parsed["city_slug"] == "iran"
+    assert parsed["category_slug"] == "beauty-services"
+    assert resolve_category_slug([], "beauty-services") == "beauty-and-haircare"
+    assert resolve_city_slug([], "iran")["id"] == "715"
+
+    html = """
+    <script>window.__PRELOADED_STATE__ = {
+      "search": {"searchData": {"formData": {"category": {"str": {"value": "beauty-and-haircare"}}}}},
+      "multiCity": {"selectedCities": [{"id": 715, "name": "کل ایران", "slug": "iran"}]}
+    };</script>
+    """
+    live = extract_search_from_preloaded(html)
+    assert live["city_id"] == "715"
+    assert live["category"] == "beauty-and-haircare"
+
+
 def test_round_robin_skips_blocked_accounts():
     today = "2026-11-01"
     accounts = [

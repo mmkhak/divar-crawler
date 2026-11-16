@@ -17,6 +17,7 @@ from app.divar.browser import BrowserPool
 from app.divar.client import DivarClient
 from app.divar.parse import FA_DIGITS, extract_token, normalize_phone_input
 from app.divar.traffic import TrafficBuffer
+from app.divar.urls import resolve_divar_search_url
 from app.exporting import listing_row, to_csv, to_xlsx
 from app.hub import EventHub
 from app.runner import JobManager, city_name
@@ -36,6 +37,17 @@ class JobIn(BaseModel):
     max_pages: int = 3
     fetch_details: bool = True
     fetch_phones: bool = False
+
+
+class JobFromUrlIn(BaseModel):
+    url: str
+    name: str = ""
+    title_filter: list[str] = Field(default_factory=list)
+    desc_filter: list[str] = Field(default_factory=list)
+    max_pages: int = 3
+    fetch_details: bool = True
+    fetch_phones: bool = False
+    start: bool = True
 
 
 class SettingsIn(BaseModel):
@@ -168,6 +180,46 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             }
         )
         job["counts"] = db.job_counts(job["id"])
+        return job
+
+    @app.post("/api/jobs/from-url")
+    async def create_job_from_url(body: JobFromUrlIn) -> dict[str, Any]:
+        try:
+            resolved = await resolve_divar_search_url(
+                body.url,
+                cities=load_cities(data),
+                categories=load_categories(data),
+                fetch_html=auth_client.fetch_html,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        category = resolved["category"]
+        city_id = str(resolved["city_id"])
+        city_label = resolved["city_name"]
+        name = body.name.strip() or f"{category} · {city_label}"
+        job = db.create_job(
+            {
+                "name": name,
+                "category": category,
+                "keywords": resolved.get("keywords") or [],
+                "city_id": city_id,
+                "city_name": city_label,
+                "title_filter": _split_words(body.title_filter),
+                "desc_filter": _split_words(body.desc_filter),
+                "max_pages": max(1, min(body.max_pages, 200)),
+                "fetch_details": body.fetch_details,
+                "fetch_phones": body.fetch_phones,
+            }
+        )
+        job["counts"] = db.job_counts(job["id"])
+        job["source_url"] = resolved.get("source_url")
+        job["resolved_from"] = resolved.get("resolved_from")
+        if body.start:
+            manager.start(job["id"])
+            job = db.get_job(job["id"]) or job
+            job["counts"] = db.job_counts(job["id"])
+            job["source_url"] = resolved.get("source_url")
+            job["resolved_from"] = resolved.get("resolved_from")
         return job
 
     @app.post("/api/jobs/{job_id}/start")
