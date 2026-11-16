@@ -116,7 +116,7 @@ def test_round_robin_skips_blocked_accounts():
     assert [first.id, second.id, third.id] == [4, 5, 4]
     none, _ = pick_account(accounts[:3], 0, today)
     assert none is None
-    refreshed = AccountView(2, "limited", 10, 50, "2026-10-31", 20, 40)
+    refreshed = AccountView(2, "active", 10, 50, "2026-10-31", 20, 40)
     picked, _ = pick_account([refreshed], 0, today)
     assert picked.id == 2
 

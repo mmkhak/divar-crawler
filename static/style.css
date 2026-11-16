@@ -101,7 +101,9 @@ td.snip { max-width: 280px; color: #3d3832; }
 .status { font-weight: 700; }
 .status.running { color: var(--accent); }
 .status.paused, .status.limited { color: #9a6700; }
-.status.expired, .status.error { color: #9b2335; }
+.status.expired, .status.error, .status.needs_login { color: #9b2335; }
+.status.active { color: var(--accent); }
+.account .button-link { background: #efe8dc; color: var(--ink); font-weight: 600; }
 @media (max-width: 720px) {
   header { flex-direction: column; align-items: stretch; }
 }

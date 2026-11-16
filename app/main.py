@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.catalog import load_categories, load_cities, refresh_cities, search_cities
 from app.db import Database
-from app.divar.browser import BrowserSession
+from app.divar.browser import BrowserPool
 from app.divar.client import DivarClient
 from app.divar.parse import FA_DIGITS, extract_token, normalize_phone_input
 from app.divar.traffic import TrafficBuffer
@@ -59,6 +59,13 @@ class CodeConfirm(BaseModel):
     delay_max: float = 40
 
 
+class BrowserAccountIn(BaseModel):
+    label: str = ""
+    daily_cap: int = 50
+    delay_min: float = 20
+    delay_max: float = 40
+
+
 def _split_words(values: list[str]) -> list[str]:
     words: list[str] = []
     for value in values:
@@ -76,8 +83,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     hub = EventHub()
     traffic = TrafficBuffer()
     traffic.on_entry(lambda entry: hub.publish("traffic", entry))
-    browser = BrowserSession(data / "chrome-profile", traffic)
-    manager = JobManager(db, hub, data, traffic=traffic, browser=browser)
+    browsers = BrowserPool(data / "chrome-profiles", traffic)
+    manager = JobManager(db, hub, data, traffic=traffic, browsers=browsers)
     auth_client = DivarClient(traffic=traffic)
     app = FastAPI(title="پنل دیوار")
     app.state.db = db
@@ -85,7 +92,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     app.state.data = data
     app.state.auth = auth_client
     app.state.traffic = traffic
-    app.state.browser = browser
+    app.state.browsers = browsers
+    app.state.browser = browsers  # captcha endpoints
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -213,26 +221,93 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         app.state.traffic.clear()
         return {"ok": True}
 
-    @app.post("/api/browser/open-login")
-    async def open_browser_login() -> dict[str, Any]:
-        try:
-            await app.state.browser.open_login()
-        except Exception as exc:
-            raise HTTPException(500, f"باز کردن Chromium ناموفق بود: {exc}") from exc
-        return {
-            "ok": True,
-            "message": "پنجره Chromium باز شد. یک‌بار در همان پنجره وارد دیوار شوید.",
-        }
-
     @app.get("/api/browser/captcha")
     async def browser_captcha_status() -> dict[str, Any]:
-        return browser.captcha_status()
+        return browsers.captcha_status()
 
     @app.post("/api/browser/captcha/resolved")
     async def browser_captcha_resolved() -> dict[str, Any]:
-        status = browser.resolve_captcha()
+        status = browsers.resolve_captcha()
         hub.publish("captcha", status)
         return {"ok": True, **status}
+
+    @app.get("/api/browser-accounts")
+    async def browser_accounts() -> list[dict[str, Any]]:
+        return db.list_browser_accounts()
+
+    @app.post("/api/browser-accounts")
+    async def create_browser_account(body: BrowserAccountIn) -> dict[str, Any]:
+        account = db.add_browser_account(
+            {
+                "label": body.label,
+                "daily_cap": body.daily_cap,
+                "delay_min": body.delay_min,
+                "delay_max": body.delay_max,
+            }
+        )
+        hub.publish("browser_account", account)
+        return account
+
+    @app.post("/api/browser-accounts/{account_id}/open-login")
+    async def open_browser_account_login(account_id: int) -> dict[str, Any]:
+        account = db.get_browser_account(account_id)
+        if not account:
+            raise HTTPException(404, "اکانت پیدا نشد")
+        try:
+            await browsers.get(account_id).open_login()
+        except Exception as exc:
+            raise HTTPException(500, f"باز کردن Chromium ناموفق بود: {exc}") from exc
+        db.update_browser_account(account_id, status="needs_login", last_error=None)
+        return {
+            "ok": True,
+            "message": "Chromium این اکانت باز شد. در VNC وارد دیوار شو، بعد «تأیید اتصال» را بزن.",
+            "vnc_url": browsers.vnc_url,
+            "account": db.get_browser_account(account_id),
+        }
+
+    @app.post("/api/browser-accounts/{account_id}/verify")
+    async def verify_browser_account(account_id: int) -> dict[str, Any]:
+        account = db.get_browser_account(account_id)
+        if not account:
+            raise HTTPException(404, "اکانت پیدا نشد")
+        try:
+            result = await browsers.get(account_id).verify_login()
+        except Exception as exc:
+            raise HTTPException(500, f"بررسی لاگین ناموفق بود: {exc}") from exc
+        if result.get("needs_captcha"):
+            hub.publish("captcha", browsers.note_captcha(account_id))
+            updated = db.update_browser_account(
+                account_id, status="needs_login", last_error="captcha"
+            )
+            return {"ok": False, "needs_captcha": True, "account": updated, **browsers.captcha_status()}
+        if not result.get("logged_in"):
+            updated = db.update_browser_account(
+                account_id, status="needs_login", phone=None, last_error="not logged in"
+            )
+            hub.publish("browser_account", updated)
+            return {"ok": False, "logged_in": False, "account": updated}
+        phone = result.get("phone")
+        label = account["label"]
+        if phone and (not label or label.startswith("اکانت")):
+            label = phone
+        updated = db.update_browser_account(
+            account_id,
+            status="active",
+            phone=phone,
+            label=label,
+            last_error=None,
+        )
+        hub.publish("browser_account", updated)
+        return {"ok": True, "logged_in": True, "account": updated}
+
+    @app.delete("/api/browser-accounts/{account_id}")
+    async def delete_browser_account(account_id: int) -> dict[str, bool]:
+        if not db.get_browser_account(account_id):
+            raise HTTPException(404, "اکانت پیدا نشد")
+        await browsers.close(account_id)
+        db.delete_browser_account(account_id)
+        hub.publish("browser_account", {"id": account_id, "deleted": True})
+        return {"ok": True}
 
     @app.get("/api/events")
     async def events() -> StreamingResponse:

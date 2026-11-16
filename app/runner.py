@@ -8,9 +8,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.accounts import account_view_from_row, pick_account
 from app.catalog import load_cities
-from app.db import Database
-from app.divar.browser import BrowserSession
+from app.db import Database, today_key
+from app.divar.browser import BrowserPool
 from app.divar.client import DivarClient, RateLimiter, build_search, jitter
 from app.divar.parse import (
     canonical_phones,
@@ -30,18 +31,20 @@ class JobManager:
         hub: EventHub,
         data_dir: Any,
         traffic: TrafficBuffer | None = None,
-        browser: BrowserSession | None = None,
+        browsers: BrowserPool | None = None,
     ) -> None:
         self.db = db
         self.hub = hub
         self.data_dir = Path(data_dir)
         self.traffic = traffic or TrafficBuffer()
         self.client = DivarClient(traffic=self.traffic)
-        self.browser = browser or BrowserSession(self.data_dir / "chrome-profile", self.traffic)
+        self.browsers = browsers or BrowserPool(self.data_dir / "chrome-profiles", self.traffic)
+        self.browser = self.browsers  # captcha / login helpers on pool
         self.limiter = RateLimiter(float(db.setting("anon_rps") or 1))
         self._tasks: dict[int, asyncio.Task] = {}
         self._pause: dict[int, asyncio.Event] = {}
         self._stop: dict[int, asyncio.Event] = {}
+        self._account_cursor = 0
 
     def refresh_rate(self) -> None:
         self.limiter.set_rps(float(self.db.setting("anon_rps") or 1))
@@ -225,20 +228,31 @@ class JobManager:
         # Phones already open the same page; skip a second visit.
         if job["fetch_phones"] and listing.get("phone_status") == "pending":
             return
+        account = self._pick_browser_account()
+        if account is None:
+            self._log(job_id, "برای جزئیات حداقل یک اکانت Chromium وصل‌شده لازم است", "error")
+            return
+        session = self.browsers.get(account.id)
         try:
-            outcome = await self.browser.fetch_listing_info(listing["token"])
+            outcome = await session.fetch_listing_info(listing["token"])
         except Exception as exc:
             self._log(job_id, f"جزئیات مرورگر {listing['token']}: {exc}", "warn")
             return
         if outcome.get("needs_captcha"):
-            self.hub.publish("captcha", self.browser.captcha_status())
-            self._log(job_id, "کپچا هنگام جزئیات — VNC را باز کن و بعد «کپچا حل شد» را بزن", "error")
-            await self.browser.wait_captcha_resolved()
-            self.hub.publish("captcha", self.browser.captcha_status())
+            self.hub.publish("captcha", self.browsers.note_captcha(account.id))
+            self._log(
+                job_id,
+                f"کپچا روی اکانت {account.id} — VNC را باز کن و بعد «کپچا حل شد» را بزن",
+                "error",
+            )
+            await self.browsers.wait_captcha_resolved()
+            self.hub.publish("captcha", self.browsers.captcha_status())
             await self._fetch_detail(job_id, listing, job)
             return
         if outcome.get("needs_login"):
-            self._log(job_id, "برای جزئیات باید Chromium لاگین باشد", "error")
+            self.db.update_browser_account(account.id, status="needs_login", last_error="login required")
+            self.hub.publish("browser_account", self.db.get_browser_account(account.id))
+            self._log(job_id, f"اکانت {account.id} لاگین نیست", "error")
             return
         description = outcome.get("description") or ""
         subtitle = outcome.get("subtitle") or ""
@@ -278,6 +292,12 @@ class JobManager:
         )
         self.hub.publish("listing", _public_listing(updated, job["name"]))
 
+    def _pick_browser_account(self):
+        rows = self.db.list_browser_accounts()
+        views = [account_view_from_row(row) for row in rows]
+        picked, self._account_cursor = pick_account(views, self._account_cursor, today_key())
+        return picked
+
     async def _drain_phones(self, job_id: int, limit: int | None = None) -> None:
         job = self.db.get_job(job_id)
         if not job or not job["fetch_phones"]:
@@ -290,37 +310,50 @@ class JobManager:
             if not pending:
                 return
             listing = pending[0]
-            delay_min = float(self.db.setting("delay_min") or 20)
-            delay_max = float(self.db.setting("delay_max") or 40)
+            account = self._pick_browser_account()
+            if account is None:
+                self._log(
+                    job_id,
+                    "هیچ اکانت Chromium فعالی نیست؛ از برگه حساب‌ها چند اکانت وصل کنید",
+                    "error",
+                )
+                return
+            row = self.db.get_browser_account(account.id) or {}
+            delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
+            delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
             wait = jitter(delay_min, delay_max)
-            self._log(job_id, f"شماره با Chromium پس از {wait:.0f} ثانیه · {listing['token']}")
+            label = row.get("phone") or row.get("label") or f"#{account.id}"
+            self._log(
+                job_id,
+                f"شماره با اکانت {label} پس از {wait:.0f} ثانیه · {listing['token']}",
+            )
             await asyncio.sleep(wait)
             if not await self._wait_controls(job_id):
                 return
+            session = self.browsers.get(account.id)
             try:
-                outcome = await self.browser.reveal_phone(listing["token"])
+                outcome = await session.reveal_phone(listing["token"])
             except Exception as exc:
-                self._log(job_id, f"خطای شماره مرورگر: {exc}", "warn")
+                self._log(job_id, f"خطای شماره مرورگر ({label}): {exc}", "warn")
                 return
             if outcome.get("needs_captcha"):
-                status = self.browser.captcha_status()
-                self.hub.publish("captcha", status)
+                self.hub.publish("captcha", self.browsers.note_captcha(account.id))
                 self._log(
                     job_id,
-                    "کپچا آمد — VNC را باز کن، حل کن، بعد در پنل «کپچا حل شد» را بزن",
+                    f"کپچا روی اکانت {label} — VNC را باز کن، حل کن، بعد «کپچا حل شد» را بزن",
                     "error",
                 )
-                await self.browser.wait_captcha_resolved()
-                self.hub.publish("captcha", self.browser.captcha_status())
+                await self.browsers.wait_captcha_resolved()
+                self.hub.publish("captcha", self.browsers.captcha_status())
                 self._log(job_id, "کپچا رفع شد؛ ادامه دریافت شماره")
                 continue
             if outcome.get("needs_login"):
-                self._log(
-                    job_id,
-                    "نشست Chromium لاگین نیست؛ از برگه حساب‌ها «باز کردن کروم برای لاگین» را بزنید",
-                    "error",
+                self.db.update_browser_account(
+                    account.id, status="needs_login", last_error="login required"
                 )
-                return
+                self.hub.publish("browser_account", self.db.get_browser_account(account.id))
+                self._log(job_id, f"اکانت {label} لاگین نیست؛ اکانت بعدی را امتحان می‌کنم", "warn")
+                continue
             phones = list(outcome.get("phones") or [])
             description = outcome.get("description") or listing.get("description") or ""
             if not phones:
@@ -345,8 +378,10 @@ class JobManager:
             if outcome.get("specs"):
                 updates["specs_json"] = json.dumps(outcome["specs"], ensure_ascii=False)
             updated = self.db.update_listing(listing["id"], **updates)
+            self.db.bump_browser_account_view(account.id)
+            self.hub.publish("browser_account", self.db.get_browser_account(account.id))
             if phones:
-                self._log(job_id, f"شماره {listing['token']}: {joined}")
+                self._log(job_id, f"شماره {listing['token']}: {joined} · اکانت {label}")
             else:
                 detail = outcome.get("error") or "خالی"
                 self._log(job_id, f"شماره‌ای برای {listing['token']} نبود ({detail})", "warn")

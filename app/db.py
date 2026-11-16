@@ -31,6 +31,20 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_used_at TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS browser_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    phone TEXT,
+    status TEXT NOT NULL DEFAULT 'needs_login',
+    daily_cap INTEGER NOT NULL DEFAULT 50,
+    views_today INTEGER NOT NULL DEFAULT 0,
+    views_day TEXT,
+    delay_min REAL NOT NULL DEFAULT 20,
+    delay_max REAL NOT NULL DEFAULT 40,
+    last_error TEXT,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -385,11 +399,93 @@ class Database:
             self._conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
             self._conn.commit()
 
+    def add_browser_account(self, fields: dict[str, Any]) -> dict[str, Any]:
+        stamp = now_iso()
+        label = (fields.get("label") or "").strip() or "اکانت Chromium"
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO browser_accounts(
+                    label, phone, status, daily_cap, views_today, views_day,
+                    delay_min, delay_max, created_at
+                ) VALUES (?, NULL, 'needs_login', ?, 0, ?, ?, ?, ?)""",
+                (
+                    label,
+                    int(fields.get("daily_cap") or 50),
+                    today_key(),
+                    float(fields.get("delay_min") or 20),
+                    float(fields.get("delay_max") or 40),
+                    stamp,
+                ),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM browser_accounts WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+        return dict(row)
+
+    def list_browser_accounts(self) -> list[dict[str, Any]]:
+        self._roll_browser_daily_caps()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM browser_accounts ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
+
+    def get_browser_account(self, account_id: int) -> dict[str, Any] | None:
+        self._roll_browser_daily_caps()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM browser_accounts WHERE id=?", (account_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_browser_account(self, account_id: int, **fields: Any) -> dict[str, Any] | None:
+        if not fields:
+            return self.get_browser_account(account_id)
+        cols = ", ".join(f"{key}=?" for key in fields)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE browser_accounts SET {cols} WHERE id=?",
+                (*fields.values(), account_id),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM browser_accounts WHERE id=?", (account_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_browser_account(self, account_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM browser_accounts WHERE id=?", (account_id,))
+            self._conn.commit()
+
+    def bump_browser_account_view(self, account_id: int) -> None:
+        day = today_key()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE browser_accounts
+                   SET views_today = CASE WHEN views_day=? THEN views_today+1 ELSE 1 END,
+                       views_day=?, last_used_at=?
+                   WHERE id=?""",
+                (day, day, now_iso(), account_id),
+            )
+            self._conn.commit()
+
     def _roll_daily_caps(self) -> None:
         day = today_key()
         with self._lock:
             self._conn.execute(
                 """UPDATE accounts
+                   SET views_today=0, views_day=?,
+                       status=CASE WHEN status='limited' THEN 'active' ELSE status END
+                   WHERE views_day IS NULL OR views_day!=?""",
+                (day, day),
+            )
+            self._conn.commit()
+
+    def _roll_browser_daily_caps(self) -> None:
+        day = today_key()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE browser_accounts
                    SET views_today=0, views_day=?,
                        status=CASE WHEN status='limited' THEN 'active' ELSE status END
                    WHERE views_day IS NULL OR views_day!=?""",

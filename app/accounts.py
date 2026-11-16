@@ -17,13 +17,22 @@ class AccountView:
 
 
 def available(account: AccountView, today: str) -> bool:
-    if account.status == "expired":
+    if account.status != "active":
         return False
     if account.views_today >= account.daily_cap:
         return False
-    if account.status == "limited" and account.views_day == today:
-        return False
     return True
+
+def account_view_from_row(row: dict) -> AccountView:
+    return AccountView(
+        id=int(row["id"]),
+        status=str(row.get("status") or "needs_login"),
+        views_today=int(row.get("views_today") or 0),
+        daily_cap=int(row.get("daily_cap") or 50),
+        views_day=row.get("views_day"),
+        delay_min=float(row.get("delay_min") or 20),
+        delay_max=float(row.get("delay_max") or 40),
+    )
 
 
 def pick_account(accounts: list[AccountView], cursor: int, today: str) -> tuple[AccountView | None, int]:

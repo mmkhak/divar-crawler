@@ -89,19 +89,35 @@ function statusLabel(status) {
   return { running: "در حال اجرا", paused: "متوقف موقت", stopped: "متوقف", done: "تمام", error: "خطا", limited: "محدود امروز", expired: "منقضی", active: "فعال" }[status] || status;
 }
 
-function renderAccounts(list) {
-  $("#account-list").innerHTML = list.map((account) => `
+function browserStatusLabel(status) {
+  return {
+    active: "وصل شده",
+    needs_login: "نیاز به لاگین",
+    limited: "سقف امروز",
+    error: "خطا",
+  }[status] || statusLabel(status);
+}
+
+function renderBrowserAccounts(list) {
+  $("#browser-account-list").innerHTML = list.map((account) => `
     <article class="account">
       <div>
-        <strong dir="ltr">${escapeHtml(account.phone)}</strong>
-        <span class="status ${account.status}">${statusLabel(account.status)}</span>
-        <div class="meta">امروز ${account.views_today} از ${account.daily_cap}
+        <strong>${escapeHtml(account.label || ("اکانت " + account.id))}</strong>
+        <span class="status ${account.status}">${browserStatusLabel(account.status)}</span>
+        <div class="meta">
+          ${account.phone ? `<span dir="ltr">${escapeHtml(account.phone)}</span> · ` : "شماره هنوز خوانده نشده · "}
+          امروز ${account.views_today} از ${account.daily_cap}
           · تأخیر ${account.delay_min}–${account.delay_max} ثانیه
-          ${account.proxy ? "· پروکسی دارد" : ""}
-          ${account.last_error ? "· " + escapeHtml(account.last_error) : ""}</div>
+          ${account.last_error ? "· " + escapeHtml(account.last_error) : ""}
+        </div>
       </div>
-      <button class="ghost" data-del="${account.id}">حذف</button>
-    </article>`).join("") || `<p class="muted">حسابی ذخیره نشده. بدون حساب فقط جستجو و جزئیات انجام می‌شود.</p>`;
+      <div class="row">
+        <a class="button-link" href="https://divar2.pixlink.ir/vnc.html" target="_blank" rel="noopener">VNC</a>
+        <button type="button" data-login="${account.id}">لاگین در کروم</button>
+        <button type="button" data-verify="${account.id}">تأیید اتصال</button>
+        <button class="ghost" type="button" data-del="${account.id}">حذف</button>
+      </div>
+    </article>`).join("") || `<p class="muted">هنوز اکانتی نیست. حداقل یکی اضافه و لاگین کن تا گرفتن شماره شروع شود.</p>`;
 }
 
 function upsertRow(row) {
@@ -187,20 +203,64 @@ $("#job-list").addEventListener("click", async (event) => {
   await refreshJobs();
 });
 
-$("#account-list").addEventListener("click", async (event) => {
-  const btn = event.target.closest("button[data-del]");
-  if (!btn) return;
-  await api("/api/accounts/" + btn.dataset.del, { method: "DELETE" });
-  renderAccounts(await api("/api/accounts"));
+$("#browser-account-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.target);
+  $("#browser-account-msg").textContent = "در حال افزودن…";
+  try {
+    await api("/api/browser-accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        label: form.get("label"),
+        daily_cap: Number(form.get("daily_cap")),
+        delay_min: Number(form.get("delay_min")),
+        delay_max: Number(form.get("delay_max")),
+      }),
+    });
+    event.target.reset();
+    $("#browser-account-msg").textContent = "اکانت اضافه شد. لاگین و بعد تأیید اتصال را بزن.";
+    renderBrowserAccounts(await api("/api/browser-accounts"));
+  } catch (err) {
+    $("#browser-account-msg").textContent = err.message;
+  }
 });
 
-$("#open-browser-login").addEventListener("click", async () => {
-  $("#browser-msg").textContent = "در حال باز کردن Chromium…";
+$("#browser-account-list").addEventListener("click", async (event) => {
+  const btn = event.target.closest("button");
+  if (!btn) return;
+  const msg = $("#browser-account-msg");
   try {
-    const result = await api("/api/browser/open-login", { method: "POST" });
-    $("#browser-msg").textContent = result.message || "باز شد.";
+    if (btn.dataset.login) {
+      msg.textContent = "در حال باز کردن Chromium این اکانت…";
+      const result = await api(`/api/browser-accounts/${btn.dataset.login}/open-login`, { method: "POST" });
+      if (result.vnc_url) window.open(result.vnc_url, "_blank", "noopener");
+      msg.textContent = result.message || "باز شد.";
+      renderBrowserAccounts(await api("/api/browser-accounts"));
+      return;
+    }
+    if (btn.dataset.verify) {
+      msg.textContent = "در حال بررسی لاگین…";
+      const result = await api(`/api/browser-accounts/${btn.dataset.verify}/verify`, { method: "POST" });
+      if (result.needs_captcha) {
+        showCaptchaBanner(result);
+        msg.textContent = "کپچا آمد؛ در VNC حل کن و دوباره تأیید بزن.";
+      } else if (result.ok) {
+        msg.textContent = result.account.phone
+          ? `وصل شد: ${result.account.phone}`
+          : "وصل شد.";
+      } else {
+        msg.textContent = "هنوز لاگین نیست؛ در VNC وارد شو و دوباره تأیید کن.";
+      }
+      renderBrowserAccounts(await api("/api/browser-accounts"));
+      return;
+    }
+    if (btn.dataset.del) {
+      await api("/api/browser-accounts/" + btn.dataset.del, { method: "DELETE" });
+      renderBrowserAccounts(await api("/api/browser-accounts"));
+    }
   } catch (err) {
-    $("#browser-msg").textContent = err.message;
+    msg.textContent = err.message;
   }
 });
 
@@ -218,44 +278,6 @@ $("#captcha-done").addEventListener("click", async () => {
     showCaptchaBanner(result);
   } catch (err) {
     appendLog({ level: "error", message: err.message, created_at: new Date().toISOString() });
-  }
-});
-
-$("#send-code").addEventListener("click", async () => {
-  const form = new FormData($("#account-form"));
-  $("#account-msg").textContent = "در حال درخواست کد…";
-  try {
-    const result = await api("/api/accounts/request-code", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone: form.get("phone"), proxy: form.get("proxy") }),
-    });
-    $("#account-msg").textContent = "کد برای " + result.phone + " درخواست شد. آن را وارد کنید.";
-  } catch (err) {
-    $("#account-msg").textContent = err.message;
-  }
-});
-
-$("#account-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  try {
-    await api("/api/accounts/confirm", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        phone: form.get("phone"),
-        code: form.get("code"),
-        proxy: form.get("proxy"),
-        daily_cap: Number(form.get("daily_cap")),
-        delay_min: Number(form.get("delay_min")),
-        delay_max: Number(form.get("delay_max")),
-      }),
-    });
-    $("#account-msg").textContent = "حساب ذخیره شد.";
-    renderAccounts(await api("/api/accounts"));
-  } catch (err) {
-    $("#account-msg").textContent = err.message;
   }
 });
 
@@ -322,7 +344,7 @@ function connect() {
     else state.jobs.unshift(job);
     renderJobs();
   });
-  source.addEventListener("account", () => api("/api/accounts").then(renderAccounts));
+  source.addEventListener("browser_account", () => api("/api/browser-accounts").then(renderBrowserAccounts));
   source.addEventListener("captcha", (event) => showCaptchaBanner(JSON.parse(event.data)));
   source.onerror = () => { source.close(); setTimeout(connect, 2000); };
 }
@@ -342,7 +364,7 @@ async function boot() {
   paintRows();
   (await api("/api/logs")).forEach(appendLog);
   (await api("/api/traffic")).forEach(appendTraffic);
-  renderAccounts(await api("/api/accounts"));
+  renderBrowserAccounts(await api("/api/browser-accounts"));
   showCaptchaBanner(await api("/api/browser/captcha"));
   connect();
   const tab = (location.hash || "").replace("#", "");

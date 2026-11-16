@@ -127,6 +127,40 @@ class BrowserSession:
                 "open login",
             )
 
+    async def verify_login(self) -> dict[str, Any]:
+        """Open my-divar and detect whether this profile is logged in."""
+        async with self._get_lock():
+            await self.ensure()
+            assert self._page is not None
+            page = self._page
+            started = time.monotonic()
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+            self.traffic.record(
+                "BROWSER",
+                LOGIN_URL,
+                200,
+                int((time.monotonic() - started) * 1000),
+                "verify login",
+            )
+            await self._dismiss_overlays(page)
+            if await self._looks_like_captcha(page):
+                result = self._captcha_result(LOGIN_URL, started)
+                return {
+                    "logged_in": False,
+                    "phone": None,
+                    "needs_captcha": True,
+                    "vnc_url": result.get("vnc_url"),
+                }
+            if await self._looks_like_login(page):
+                return {"logged_in": False, "phone": None, "needs_captcha": False}
+            text = await self._safe_text(page)
+            phones = canonical_phones(text)
+            return {
+                "logged_in": True,
+                "phone": phones[0] if phones else None,
+                "needs_captcha": False,
+            }
+
     async def fetch_listing_info(self, token: str) -> dict[str, Any]:
         """Open listing page in Chromium and scrape description — no API token call."""
         async with self._get_lock():
@@ -465,3 +499,61 @@ class BrowserSession:
             return await page.locator("body").inner_text(timeout=5000)
         except Exception:
             return ""
+
+
+class BrowserPool:
+    """One persistent Chromium profile per browser account id."""
+
+    def __init__(self, root: Path, traffic: TrafficBuffer | None = None) -> None:
+        self.root = Path(root)
+        self.traffic = traffic or TrafficBuffer()
+        self._sessions: dict[int, BrowserSession] = {}
+        self._captcha_account_id: int | None = None
+        self.vnc_url = os.environ.get("VNC_URL", DEFAULT_VNC_URL).strip() or DEFAULT_VNC_URL
+
+    def profile_dir(self, account_id: int) -> Path:
+        return self.root / str(account_id)
+
+    def get(self, account_id: int) -> BrowserSession:
+        session = self._sessions.get(account_id)
+        if session is None:
+            session = BrowserSession(self.profile_dir(account_id), self.traffic)
+            self._sessions[account_id] = session
+        return session
+
+    def captcha_status(self) -> dict[str, Any]:
+        active = any(session.captcha_active for session in self._sessions.values())
+        if not active:
+            self._captcha_account_id = None
+        return {
+            "active": active,
+            "vnc_url": self.vnc_url,
+            "account_id": self._captcha_account_id,
+        }
+
+    def note_captcha(self, account_id: int) -> dict[str, Any]:
+        self._captcha_account_id = account_id
+        return self.captcha_status()
+
+    def resolve_captcha(self) -> dict[str, Any]:
+        for session in self._sessions.values():
+            if session.captcha_active:
+                session.resolve_captcha()
+        self._captcha_account_id = None
+        return self.captcha_status()
+
+    async def wait_captcha_resolved(self) -> None:
+        for session in self._sessions.values():
+            if session.captcha_active:
+                await session.wait_captcha_resolved()
+                break
+        self._captcha_account_id = None
+
+    async def close(self, account_id: int) -> None:
+        session = self._sessions.pop(account_id, None)
+        if session is not None:
+            await session.close()
+
+    async def close_all(self) -> None:
+        for account_id in list(self._sessions):
+            await self.close(account_id)

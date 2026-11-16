@@ -56,10 +56,12 @@ def test_job_streams_two_pages_and_exports(tmp_path):
         }
 
     with TestClient(app) as client:
+        account = client.post("/api/browser-accounts", json={"label": "detail"}).json()
+        app.state.db.update_browser_account(account["id"], status="active", phone="09120000001")
+        app.state.browsers.get(account["id"]).fetch_listing_info = fetch_listing_info
         app.state.db.update_settings({"anon_rps": "20", "default_daily_cap": "50", "delay_min": "20", "delay_max": "40"})
         app.state.manager.refresh_rate()
         app.state.manager.client.search = search
-        app.state.manager.browser.fetch_listing_info = fetch_listing_info
         created = client.post(
             "/api/jobs",
             json={
@@ -187,12 +189,18 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         }
 
     with TestClient(app) as client:
+        account = client.post(
+            "/api/browser-accounts",
+            json={"label": "A1", "daily_cap": 50, "delay_min": 0.01, "delay_max": 0.01},
+        ).json()
+        app.state.db.update_browser_account(account["id"], status="active", phone="09121111111")
+        session = app.state.browsers.get(account["id"])
+        session.reveal_phone = reveal_phone
         app.state.db.update_settings(
             {"anon_rps": "20", "default_daily_cap": "50", "delay_min": "0.01", "delay_max": "0.01"}
         )
         app.state.manager.refresh_rate()
         app.state.manager.client.search = search
-        app.state.manager.browser.reveal_phone = reveal_phone
         created = client.post(
             "/api/jobs",
             json={
@@ -220,34 +228,45 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         assert revealed == ["phoneTok1"]
 
 
-def test_open_browser_login_endpoint(tmp_path):
+def test_browser_accounts_crud_and_captcha(tmp_path):
     app = create_app(tmp_path)
-    called = []
+    opened = []
 
     async def open_login():
-        called.append(True)
+        opened.append(True)
 
-    app.state.browser.open_login = open_login
+    async def verify_login():
+        return {"logged_in": True, "phone": "09123334444", "needs_captcha": False}
+
     with TestClient(app) as client:
-        result = client.post("/api/browser/open-login")
-        assert result.status_code == 200
-        assert result.json()["ok"] is True
-        assert called
+        created = client.post("/api/browser-accounts", json={"label": "اصلی"})
+        assert created.status_code == 200
+        account_id = created.json()["id"]
+        assert created.json()["status"] == "needs_login"
 
+        session = app.state.browsers.get(account_id)
+        session.open_login = open_login
+        session.verify_login = verify_login
+        login = client.post(f"/api/browser-accounts/{account_id}/open-login")
+        assert login.status_code == 200
+        assert opened
 
-def test_captcha_status_and_resolve(tmp_path):
-    app = create_app(tmp_path)
-    with TestClient(app) as client:
+        verified = client.post(f"/api/browser-accounts/{account_id}/verify")
+        assert verified.status_code == 200
+        assert verified.json()["ok"] is True
+        assert verified.json()["account"]["status"] == "active"
+        assert verified.json()["account"]["phone"] == "09123334444"
+
+        listed = client.get("/api/browser-accounts").json()
+        assert len(listed) == 1
+        assert listed[0]["status"] == "active"
+
         idle = client.get("/api/browser/captcha")
-        assert idle.status_code == 200
         assert idle.json()["active"] is False
-        assert "vnc" in idle.json()["vnc_url"]
+        session.begin_captcha()
+        app.state.browsers.note_captcha(account_id)
+        assert client.get("/api/browser/captcha").json()["active"] is True
+        assert client.post("/api/browser/captcha/resolved").json()["active"] is False
 
-        app.state.browser.begin_captcha()
-        blocked = client.get("/api/browser/captcha").json()
-        assert blocked["active"] is True
-
-        resolved = client.post("/api/browser/captcha/resolved")
-        assert resolved.status_code == 200
-        assert resolved.json()["active"] is False
-        assert client.get("/api/browser/captcha").json()["active"] is False
+        assert client.delete(f"/api/browser-accounts/{account_id}").status_code == 200
+        assert client.get("/api/browser-accounts").json() == []
