@@ -11,6 +11,9 @@ services:
       DATA_DIR: /app/data
       PORT: "8000"
       VNC_URL: "https://divar2.pixlink.ir/vnc.html"
+      PANEL_URL: "https://divar.pixlink.ir/"
+      # TELEGRAM_BOT_TOKEN: "123:ABC"
+      # TELEGRAM_CHAT_ID: "123456789"
     volumes:
       - divar-data:/app/data
     restart: unless-stopped

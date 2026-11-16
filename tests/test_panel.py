@@ -228,6 +228,66 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         assert revealed == ["phoneTok1"]
 
 
+def test_telegram_notify_captcha_message(monkeypatch):
+    import asyncio
+
+    from app import notify
+
+    sent = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json):
+            sent["url"] = url
+            sent["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setattr(notify.httpx, "AsyncClient", FakeClient)
+    ok = asyncio.get_event_loop().run_until_complete(
+        notify.notify_captcha(
+            account_label="A1",
+            account_phone="09120000000",
+            vnc_url="https://divar2.pixlink.ir/vnc.html",
+            panel_url="https://divar.pixlink.ir/",
+        )
+    )
+    assert ok is True
+    assert "tok" in sent["url"]
+    assert sent["json"]["chat_id"] == "42"
+    assert "کپچا" in sent["json"]["text"]
+    assert "09120000000" in sent["json"]["text"]
+
+
+def test_job_loop_toggle(tmp_path):
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={"category": "beauty-and-haircare", "max_pages": 1, "fetch_details": False},
+        ).json()
+        job_id = created["id"]
+        assert created.get("loop") is False
+        enabled = client.post(f"/api/jobs/{job_id}/loop")
+        assert enabled.status_code == 200
+        assert enabled.json()["loop"] is True
+        disabled = client.post(f"/api/jobs/{job_id}/loop")
+        assert disabled.json()["loop"] is False
+
+
 def test_create_job_from_divar_url(tmp_path):
     app = create_app(tmp_path)
 

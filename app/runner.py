@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import os
+
 from app.accounts import AccountView, account_view_from_row, available
 from app.catalog import load_cities
 from app.db import Database, today_key
@@ -22,6 +24,7 @@ from app.divar.parse import (
 )
 from app.divar.traffic import TrafficBuffer
 from app.hub import EventHub
+from app.notify import notify_captcha
 
 
 class JobManager:
@@ -168,6 +171,31 @@ class JobManager:
                     if leftover:
                         self._log(job_id, "صف شماره خالی نشد؛ کار را دوباره شروع کنید", "warn")
                     fresh = self.db.get_job(job_id)
+                    if (
+                        fresh
+                        and fresh.get("loop")
+                        and fresh["status"] == "running"
+                        and await self._wait_controls(job_id)
+                    ):
+                        self.db.update_job(
+                            job_id,
+                            query_index=0,
+                            page=0,
+                            pagination=None,
+                            query_done=0,
+                            error=None,
+                        )
+                        self._log(job_id, "حلقه دائم: تمام شد؛ از اول دوباره شروع می‌شود")
+                        self._emit_job(job_id)
+                        search_done = asyncio.Event()
+                        if fresh.get("fetch_phones"):
+                            accounts = self._active_browser_accounts()
+                            if accounts:
+                                phone_task = asyncio.create_task(
+                                    self._drain_phones(job_id, search_done=search_done)
+                                )
+                        await asyncio.sleep(3)
+                        continue
                     if fresh and fresh["status"] == "running":
                         self.db.set_status(job_id, "done")
                         self._log(job_id, "کار تمام شد")
@@ -348,6 +376,15 @@ class JobManager:
             f"کپچا روی اکانت {label} — VNC را باز کن، کپچا را حل کن، بعد در پنل «کپچا حل شد» را بزن",
             "error",
         )
+        try:
+            await notify_captcha(
+                account_label=str(row.get("label") or label),
+                account_phone=row.get("phone"),
+                vnc_url=status.get("vnc_url") or self.browsers.vnc_url,
+                panel_url=os.environ.get("PANEL_URL") or None,
+            )
+        except Exception as exc:
+            self._log(job_id, f"ارسال تلگرام برای کپچا ناموفق: {exc}", "warn")
         # Keep this Chromium (with captcha) and hide the others on the shared VNC desktop.
         try:
             await self.browsers.focus(account_id)

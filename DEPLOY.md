@@ -28,9 +28,13 @@ DISPLAY=:99
 DATA_DIR=/app/data
 PORT=8000
 VNC_URL=https://divar2.pixlink.ir/vnc.html
+PANEL_URL=https://divar.pixlink.ir/
+TELEGRAM_BOT_TOKEN=123456:ABC...
+TELEGRAM_CHAT_ID=123456789
 ```
 
 اگر کپچا بیاید، بنر قرمز در پنل ظاهر می‌شود: لینک VNC + دکمه «کپچا حل شد».
+با `TELEGRAM_BOT_TOKEN` و `TELEGRAM_CHAT_ID` همان لحظه پیام تلگرام هم می‌آید.
 
 5. پنل را پشت Basic Auth / فایروال بگذار؛ احراز هویت داخلی ندارد.
 

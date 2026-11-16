@@ -37,6 +37,7 @@ class JobIn(BaseModel):
     max_pages: int = 3
     fetch_details: bool = True
     fetch_phones: bool = False
+    loop: bool = False
 
 
 class JobFromUrlIn(BaseModel):
@@ -47,6 +48,7 @@ class JobFromUrlIn(BaseModel):
     max_pages: int = 3
     fetch_details: bool = True
     fetch_phones: bool = False
+    loop: bool = False
     start: bool = True
 
 
@@ -184,6 +186,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 "max_pages": max(1, min(body.max_pages, 200)),
                 "fetch_details": body.fetch_details,
                 "fetch_phones": body.fetch_phones,
+                "loop": body.loop,
             }
         )
         job["counts"] = db.job_counts(job["id"])
@@ -216,6 +219,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 "max_pages": max(1, min(body.max_pages, 200)),
                 "fetch_details": body.fetch_details,
                 "fetch_phones": body.fetch_phones,
+                "loop": body.loop,
             }
         )
         job["counts"] = db.job_counts(job["id"])
@@ -249,6 +253,17 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     async def stop_job(job_id: int) -> dict[str, Any]:
         _require_job(db, job_id)
         await manager.stop(job_id)
+        job = db.get_job(job_id)
+        job["counts"] = db.job_counts(job_id)
+        return job
+
+    @app.post("/api/jobs/{job_id}/loop")
+    async def toggle_job_loop(job_id: int) -> dict[str, Any]:
+        job = _require_job(db, job_id)
+        enabled = not bool(job.get("loop"))
+        db.update_job(job_id, loop=enabled)
+        if enabled and job["status"] in {"done", "stopped", "paused", "error"}:
+            manager.start(job_id)
         job = db.get_job(job_id)
         job["counts"] = db.job_counts(job_id)
         return job

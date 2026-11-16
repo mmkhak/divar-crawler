@@ -68,12 +68,14 @@ function renderJobs() {
       <div>
         <strong>${escapeHtml(job.name)}</strong>
         <span class="status ${job.status}">${statusLabel(job.status)}</span>
+        ${job.loop ? `<span class="status running">حلقه دائم</span>` : ""}
         <div class="meta">${escapeHtml(job.category)} · ${escapeHtml(job.city_name)} · صفحه ${job.page}/${job.max_pages}
           · آگهی ${counts.listings || 0} · توضیح ${counts.with_description || 0} · شماره ${counts.with_phone || 0}</div>
         ${job.error ? `<div class="meta">${escapeHtml(job.error)}</div>` : ""}
       </div>
       <div class="row">
         <button data-act="start" data-id="${job.id}">شروع / ادامه</button>
+        <button class="${job.loop ? "" : "ghost"}" data-act="loop" data-id="${job.id}">${job.loop ? "خاموش کردن حلقه" : "حلقه دائم"}</button>
         <button class="ghost" data-act="pause" data-id="${job.id}">مکث</button>
         <button class="ghost" data-act="stop" data-id="${job.id}">توقف</button>
       </div>
@@ -206,6 +208,7 @@ $("#url-job-form").addEventListener("submit", async (event) => {
         max_pages: Number(form.get("max_pages") || 5),
         fetch_phones: form.get("fetch_phones") === "on",
         fetch_details: form.get("fetch_details") === "on",
+        loop: form.get("loop") === "on",
         start: true,
       }),
     });
@@ -230,6 +233,7 @@ $("#job-form").addEventListener("submit", async (event) => {
     max_pages: Number(form.get("max_pages") || 2),
     fetch_phones: form.get("fetch_phones") === "on",
     fetch_details: form.get("fetch_details") === "on",
+    loop: form.get("loop") === "on",
   };
   try {
     await api("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

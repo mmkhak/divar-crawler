@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     max_pages INTEGER NOT NULL DEFAULT 5,
     fetch_details INTEGER NOT NULL DEFAULT 1,
     fetch_phones INTEGER NOT NULL DEFAULT 0,
+    loop INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'paused',
     query_index INTEGER NOT NULL DEFAULT 0,
     page INTEGER NOT NULL DEFAULT 0,
@@ -120,11 +121,17 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         for key, value in DEFAULTS.items():
             self._conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value)
             )
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "loop" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN loop INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         self._conn.close()
@@ -180,8 +187,8 @@ class Database:
             cur = self._conn.execute(
                 """INSERT INTO jobs(
                     name, category, keywords, city_id, city_name, title_filter, desc_filter,
-                    max_pages, fetch_details, fetch_phones, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, ?)""",
+                    max_pages, fetch_details, fetch_phones, loop, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, ?)""",
                 (
                     fields["name"],
                     fields["category"],
@@ -193,6 +200,7 @@ class Database:
                     int(fields["max_pages"]),
                     1 if fields["fetch_details"] else 0,
                     1 if fields["fetch_phones"] else 0,
+                    1 if fields.get("loop") else 0,
                     stamp,
                     stamp,
                 ),
@@ -217,6 +225,12 @@ class Database:
         fields["updated_at"] = now_iso()
         if "pagination" in fields:
             fields["pagination_json"] = json.dumps(fields.pop("pagination"), ensure_ascii=False)
+        if "loop" in fields:
+            fields["loop"] = 1 if fields["loop"] else 0
+        if "fetch_details" in fields:
+            fields["fetch_details"] = 1 if fields["fetch_details"] else 0
+        if "fetch_phones" in fields:
+            fields["fetch_phones"] = 1 if fields["fetch_phones"] else 0
         cols = ", ".join(f"{key}=?" for key in fields)
         with self._lock:
             self._conn.execute(
@@ -540,6 +554,7 @@ def _job(row: sqlite3.Row) -> dict[str, Any]:
     data["pagination"] = json.loads(raw) if raw else None
     data["fetch_details"] = bool(data["fetch_details"])
     data["fetch_phones"] = bool(data["fetch_phones"])
+    data["loop"] = bool(data.get("loop") or 0)
     data["query_done"] = bool(data["query_done"])
     return data
 

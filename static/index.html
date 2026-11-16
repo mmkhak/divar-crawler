@@ -45,6 +45,7 @@
         <label>حداکثر صفحه <input name="max_pages" type="number" min="1" max="200" value="5" /></label>
         <label class="checks"><input type="checkbox" name="fetch_details" checked /> دریافت جزئیات</label>
         <label class="checks"><input type="checkbox" name="fetch_phones" checked /> دریافت شماره</label>
+        <label class="checks"><input type="checkbox" name="loop" /> حلقه دائم (بعد از تمام شدن از اول)</label>
       </div>
       <button type="submit">ساخت کار و شروع</button>
       <p id="url-job-msg" class="muted"></p>
@@ -74,6 +75,7 @@
       <div class="row checks">
         <label><input type="checkbox" name="fetch_details" checked /> دریافت جزئیات</label>
         <label><input type="checkbox" name="fetch_phones" id="fetch-phones" /> دریافت شماره (با Chromium؛ بدون API توکن آگهی)</label>
+        <label><input type="checkbox" name="loop" /> حلقه دائم</label>
       </div>
       <button type="submit">افزودن کار</button>
     </form>
