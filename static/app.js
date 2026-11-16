@@ -116,6 +116,18 @@ function renderBrowserAccounts(list) {
           · تأخیر ${account.delay_min}–${account.delay_max} ثانیه
           ${account.last_error ? "· " + escapeHtml(account.last_error) : ""}
         </div>
+        <div class="row account-edit">
+          <label>سقف روزانه
+            <input type="number" min="1" data-cap-input="${account.id}" value="${Number(account.daily_cap) || 50}" dir="ltr" />
+          </label>
+          <label>تأخیر از
+            <input type="number" min="0" step="1" data-delay-min-input="${account.id}" value="${Number(account.delay_min) || 20}" dir="ltr" />
+          </label>
+          <label>تا
+            <input type="number" min="0" step="1" data-delay-max-input="${account.id}" value="${Number(account.delay_max) || 40}" dir="ltr" />
+          </label>
+          <button type="button" data-save="${account.id}">ذخیره سقف</button>
+        </div>
       </div>
       <div class="row">
         <a class="button-link" href="https://divar2.pixlink.ir/vnc.html" target="_blank" rel="noopener">VNC</a>
@@ -263,6 +275,29 @@ $("#browser-account-list").addEventListener("click", async (event) => {
   if (!btn) return;
   const msg = $("#browser-account-msg");
   try {
+    if (btn.dataset.save) {
+      const id = btn.dataset.save;
+      const cap = Number(document.querySelector(`[data-cap-input="${id}"]`)?.value);
+      const delayMin = Number(document.querySelector(`[data-delay-min-input="${id}"]`)?.value);
+      const delayMax = Number(document.querySelector(`[data-delay-max-input="${id}"]`)?.value);
+      msg.textContent = "در حال ذخیره…";
+      try {
+        const updated = await api(`/api/browser-accounts/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            daily_cap: cap,
+            delay_min: delayMin,
+            delay_max: delayMax,
+          }),
+        });
+        msg.textContent = `سقف اکانت ذخیره شد: ${updated.daily_cap} در روز`;
+        renderBrowserAccounts(await api("/api/browser-accounts"));
+      } catch (err) {
+        msg.textContent = err.message;
+      }
+      return;
+    }
     if (btn.dataset.focus) {
       msg.textContent = "در حال نمایش اکانت روی VNC…";
       const result = await api(`/api/browser-accounts/${btn.dataset.focus}/focus`, { method: "POST" });

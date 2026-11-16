@@ -78,6 +78,13 @@ class BrowserAccountIn(BaseModel):
     delay_max: float = 40
 
 
+class BrowserAccountUpdate(BaseModel):
+    label: str | None = None
+    daily_cap: int | None = None
+    delay_min: float | None = None
+    delay_max: float | None = None
+
+
 def _split_words(values: list[str]) -> list[str]:
     words: list[str] = []
     for value in values:
@@ -324,6 +331,39 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         )
         hub.publish("browser_account", account)
         return account
+
+    @app.patch("/api/browser-accounts/{account_id}")
+    async def patch_browser_account(account_id: int, body: BrowserAccountUpdate) -> dict[str, Any]:
+        account = db.get_browser_account(account_id)
+        if not account:
+            raise HTTPException(404, "اکانت پیدا نشد")
+        fields: dict[str, Any] = {}
+        if body.label is not None:
+            label = body.label.strip()
+            if label:
+                fields["label"] = label
+        if body.daily_cap is not None:
+            if body.daily_cap < 1:
+                raise HTTPException(400, "سقف روزانه باید حداقل ۱ باشد")
+            fields["daily_cap"] = int(body.daily_cap)
+            # If they raise the cap after hitting limit, allow the account again today.
+            if account.get("status") == "limited" and int(body.daily_cap) > int(account.get("views_today") or 0):
+                fields["status"] = "active"
+                fields["last_error"] = None
+        if body.delay_min is not None:
+            fields["delay_min"] = float(body.delay_min)
+        if body.delay_max is not None:
+            fields["delay_max"] = float(body.delay_max)
+        if not fields:
+            return account
+        if "delay_min" in fields or "delay_max" in fields:
+            delay_min = float(fields.get("delay_min", account.get("delay_min") or 20))
+            delay_max = float(fields.get("delay_max", account.get("delay_max") or 40))
+            if delay_max < delay_min:
+                raise HTTPException(400, "بیشترین تأخیر نباید از کمترین کمتر باشد")
+        updated = db.update_browser_account(account_id, **fields)
+        hub.publish("browser_account", updated)
+        return updated
 
     @app.post("/api/browser-accounts/{account_id}/open-login")
     async def open_browser_account_login(account_id: int) -> dict[str, Any]:

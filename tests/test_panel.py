@@ -273,10 +273,18 @@ def test_browser_accounts_crud_and_captcha(tmp_path):
         return {"logged_in": True, "phone": "09123334444", "needs_captcha": False}
 
     with TestClient(app) as client:
-        created = client.post("/api/browser-accounts", json={"label": "اصلی"})
+        created = client.post("/api/browser-accounts", json={"label": "اصلی", "daily_cap": 50})
         assert created.status_code == 200
         account_id = created.json()["id"]
         assert created.json()["status"] == "needs_login"
+        patched = client.patch(
+            f"/api/browser-accounts/{account_id}",
+            json={"daily_cap": 120, "delay_min": 10, "delay_max": 15},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["daily_cap"] == 120
+        assert patched.json()["delay_min"] == 10
+        assert patched.json()["delay_max"] == 15
 
         session = app.state.browsers.get(account_id)
         session.open_login = open_login

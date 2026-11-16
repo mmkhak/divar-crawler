@@ -105,6 +105,9 @@ td.snip { max-width: 280px; color: #3d3832; }
 .status.active { color: var(--accent); }
 .account .button-link { background: #efe8dc; color: var(--ink); font-weight: 600; }
 .account-captcha { border-color: #9b2335; box-shadow: 0 0 0 1px #9b2335; }
+.account-edit { margin-top: 0.6rem; align-items: end; }
+.account-edit label { margin-bottom: 0; min-width: 110px; }
+.account-edit input { width: 100%; }
 @media (max-width: 720px) {
   header { flex-direction: column; align-items: stretch; }
 }
