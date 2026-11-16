@@ -98,6 +98,7 @@ function browserStatusLabel(status) {
   return {
     active: "وصل شده",
     needs_login: "نیاز به لاگین",
+    captcha: "نیاز به کپچا",
     limited: "سقف امروز",
     error: "خطا",
   }[status] || statusLabel(status);
@@ -105,7 +106,7 @@ function browserStatusLabel(status) {
 
 function renderBrowserAccounts(list) {
   $("#browser-account-list").innerHTML = list.map((account) => `
-    <article class="account">
+    <article class="account ${account.status === "captcha" ? "account-captcha" : ""}">
       <div>
         <strong>${escapeHtml(account.label || ("اکانت " + account.id))}</strong>
         <span class="status ${account.status}">${browserStatusLabel(account.status)}</span>
@@ -118,6 +119,7 @@ function renderBrowserAccounts(list) {
       </div>
       <div class="row">
         <a class="button-link" href="https://divar2.pixlink.ir/vnc.html" target="_blank" rel="noopener">VNC</a>
+        ${account.status === "captcha" ? `<button type="button" data-focus="${account.id}">نمایش کپچا</button>` : ""}
         <button type="button" data-login="${account.id}">لاگین این اکانت</button>
         <button type="button" data-verify="${account.id}">تأیید اتصال</button>
         <button class="ghost" type="button" data-del="${account.id}">حذف</button>
@@ -236,6 +238,13 @@ $("#browser-account-list").addEventListener("click", async (event) => {
   if (!btn) return;
   const msg = $("#browser-account-msg");
   try {
+    if (btn.dataset.focus) {
+      msg.textContent = "در حال نمایش اکانت روی VNC…";
+      const result = await api(`/api/browser-accounts/${btn.dataset.focus}/focus`, { method: "POST" });
+      if (result.vnc_url) window.open(result.vnc_url, "_blank", "noopener");
+      msg.textContent = result.message || "آماده.";
+      return;
+    }
     if (btn.dataset.login) {
       msg.textContent = "در حال باز کردن Chromium این اکانت…";
       const result = await api(`/api/browser-accounts/${btn.dataset.login}/open-login`, { method: "POST" });
@@ -269,18 +278,43 @@ $("#browser-account-list").addEventListener("click", async (event) => {
   }
 });
 
+state.captchaAccountId = null;
+
 function showCaptchaBanner(payload) {
   const banner = $("#captcha-banner");
   const link = $("#captcha-vnc");
+  const title = $("#captcha-title");
+  const detail = $("#captcha-detail");
   const active = Boolean(payload && payload.active);
   banner.classList.toggle("hidden", !active);
-  if (payload && payload.vnc_url) link.href = payload.vnc_url;
+  if (!payload) return;
+  if (payload.vnc_url) link.href = payload.vnc_url;
+  state.captchaAccountId = payload.account_id || null;
+  const who = payload.account_phone || payload.account_label || (payload.account_id ? ("اکانت " + payload.account_id) : "");
+  if (active && who) {
+    title.textContent = `کپچا روی اکانت ${who}`;
+    detail.textContent = "VNC را باز کن، کپچای همین اکانت را حل کن، بعد «کپچا حل شد» را بزن. بقیه اکانت‌ها می‌توانند همزمان کار کنند.";
+  } else {
+    title.textContent = "کپچا آمد";
+    detail.textContent = "اول VNC را باز کن و کپچا را روی همان اکانت حل کن، بعد «کپچا حل شد» را بزن.";
+  }
 }
+
+$("#captcha-focus").addEventListener("click", async () => {
+  if (!state.captchaAccountId) return;
+  try {
+    const result = await api(`/api/browser-accounts/${state.captchaAccountId}/focus`, { method: "POST" });
+    if (result.vnc_url) window.open(result.vnc_url, "_blank", "noopener");
+  } catch (err) {
+    appendLog({ level: "error", message: err.message, created_at: new Date().toISOString() });
+  }
+});
 
 $("#captcha-done").addEventListener("click", async () => {
   try {
     const result = await api("/api/browser/captcha/resolved", { method: "POST" });
     showCaptchaBanner(result);
+    renderBrowserAccounts(await api("/api/browser-accounts"));
   } catch (err) {
     appendLog({ level: "error", message: err.message, created_at: new Date().toISOString() });
   }

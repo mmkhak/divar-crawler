@@ -228,9 +228,33 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/browser/captcha/resolved")
     async def browser_captcha_resolved() -> dict[str, Any]:
+        blocked_id = browsers.captcha_status().get("account_id")
         status = browsers.resolve_captcha()
+        if blocked_id:
+            db.update_browser_account(int(blocked_id), status="active", last_error=None)
+            hub.publish("browser_account", db.get_browser_account(int(blocked_id)))
+        for account in db.list_browser_accounts():
+            if account.get("status") == "captcha":
+                restored = db.update_browser_account(account["id"], status="active", last_error=None)
+                hub.publish("browser_account", restored)
         hub.publish("captcha", status)
         return {"ok": True, **status}
+
+    @app.post("/api/browser-accounts/{account_id}/focus")
+    async def focus_browser_account(account_id: int) -> dict[str, Any]:
+        account = db.get_browser_account(account_id)
+        if not account:
+            raise HTTPException(404, "اکانت پیدا نشد")
+        try:
+            await browsers.focus(account_id)
+        except Exception as exc:
+            raise HTTPException(500, f"نمایش اکانت ناموفق بود: {exc}") from exc
+        return {
+            "ok": True,
+            "vnc_url": browsers.vnc_url,
+            "message": "فقط پنجره این اکانت روی VNC مانده است.",
+            "account": account,
+        }
 
     @app.get("/api/browser-accounts")
     async def browser_accounts() -> list[dict[str, Any]]:

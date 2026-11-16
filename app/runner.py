@@ -270,14 +270,7 @@ class JobManager:
             self._log(job_id, f"جزئیات مرورگر {listing['token']}: {exc}", "warn")
             return
         if outcome.get("needs_captcha"):
-            self.hub.publish("captcha", self.browsers.note_captcha(account.id))
-            self._log(
-                job_id,
-                f"کپچا روی اکانت {account.id} — VNC را باز کن و بعد «کپچا حل شد» را بزن",
-                "error",
-            )
-            await self.browsers.wait_captcha_resolved()
-            self.hub.publish("captcha", self.browsers.captcha_status())
+            await self._handle_account_captcha(job_id, account.id)
             await self._fetch_detail(job_id, listing, job)
             return
         if outcome.get("needs_login"):
@@ -330,6 +323,42 @@ class JobManager:
             for view in (account_view_from_row(row) for row in self.db.list_browser_accounts())
             if available(view, today)
         ]
+
+    async def _handle_account_captcha(
+        self,
+        job_id: int,
+        account_id: int,
+        session: Any = None,
+    ) -> None:
+        row = self.db.get_browser_account(account_id) or {}
+        label = row.get("phone") or row.get("label") or f"#{account_id}"
+        self.db.update_browser_account(
+            account_id, status="captcha", last_error="needs captcha on contact"
+        )
+        updated = self.db.get_browser_account(account_id)
+        self.hub.publish("browser_account", updated)
+        status = self.browsers.note_captcha(
+            account_id,
+            label=str(row.get("label") or label),
+            phone=row.get("phone"),
+        )
+        self.hub.publish("captcha", status)
+        self._log(
+            job_id,
+            f"کپچا روی اکانت {label} — VNC را باز کن، کپچا را حل کن، بعد در پنل «کپچا حل شد» را بزن",
+            "error",
+        )
+        # Keep this Chromium (with captcha) and hide the others on the shared VNC desktop.
+        try:
+            await self.browsers.focus(account_id)
+        except Exception as exc:
+            self._log(job_id, f"نمایش اکانت کپچا در VNC ناموفق: {exc}", "warn")
+        waiter = session.wait_captcha_resolved if session is not None else self.browsers.wait_captcha_resolved
+        await waiter()
+        self.db.update_browser_account(account_id, status="active", last_error=None)
+        self.hub.publish("browser_account", self.db.get_browser_account(account_id))
+        self.hub.publish("captcha", self.browsers.captcha_status())
+        self._log(job_id, f"کپچا اکانت {label} رفع شد؛ ادامه")
 
     def _pick_browser_account(self) -> AccountView | None:
         accounts = self._active_browser_accounts()
@@ -414,15 +443,7 @@ class JobManager:
             self._log(job_id, f"خطای شماره مرورگر ({label}): {exc}", "warn")
             return "error"
         if outcome.get("needs_captcha"):
-            self.hub.publish("captcha", self.browsers.note_captcha(account.id))
-            self._log(
-                job_id,
-                f"کپچا روی اکانت {label} — VNC را باز کن، حل کن، بعد «کپچا حل شد» را بزن",
-                "error",
-            )
-            await session.wait_captcha_resolved()
-            self.hub.publish("captcha", self.browsers.captcha_status())
-            self._log(job_id, f"کپچا اکانت {label} رفع شد")
+            await self._handle_account_captcha(job_id, account.id, session=session)
             return "retry"
         if outcome.get("needs_login"):
             self.db.update_browser_account(

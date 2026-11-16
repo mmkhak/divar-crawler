@@ -23,11 +23,12 @@
   <p class="banner">جمع‌آوری خودکار ممکن است خلاف شرایط استفاده دیوار باشد. از حساب ثانویه استفاده کنید و پیام انبوه نفرستید. دیوار بعد از درخواست زیاد، پاسخ را کند می‌کند.</p>
   <div id="captcha-banner" class="captcha-banner hidden" role="alert">
     <div>
-      <strong>کپچا آمد</strong>
-      <span>اول VNC را باز کن و کپچا را حل کن، بعد «کپچا حل شد» را بزن تا خزش ادامه پیدا کند.</span>
+      <strong id="captcha-title">کپچا آمد</strong>
+      <span id="captcha-detail">اول VNC را باز کن و کپچا را روی همان اکانت حل کن، بعد «کپچا حل شد» را بزن.</span>
     </div>
     <div class="captcha-actions">
       <a id="captcha-vnc" class="button-link" href="https://divar2.pixlink.ir/vnc.html" target="_blank" rel="noopener">باز کردن VNC</a>
+      <button type="button" id="captcha-focus" class="ghost">نمایش همین اکانت</button>
       <button type="button" id="captcha-done">کپچا حل شد — ادامه</button>
     </div>
   </div>

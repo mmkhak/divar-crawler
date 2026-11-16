@@ -52,8 +52,15 @@ CAPTCHA_MARKERS = (
     "ربات نیستید",
     "تأیید کنید که ربات",
     "لطفاً تأیید کنید",
+    "تأیید امنیتی",
+    "تایید امنیتی",
+    "هویت خود را تأیید",
+    "هویت خود را تایید",
+    "تصاویر را انتخاب",
     "دسترسی شما محدود",
     "درخواست مشکوک",
+    "برای ادامه تأیید",
+    "برای ادامه تایید",
 )
 
 
@@ -344,6 +351,9 @@ class BrowserSession:
                     "description": fields.get("description") or "",
                 }
 
+            if self._body_looks_like_captcha(response_body):
+                return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
+
             phones = phones_from_contact(response_body) if response_body else []
             if not phones:
                 await page.wait_for_timeout(1500)
@@ -355,6 +365,9 @@ class BrowserSession:
                 )
                 blob = " ".join(tels) + " " + await self._safe_text(page)
                 phones = canonical_phones(blob)
+                # Clicked contact but no number and a challenge modal is up.
+                if not phones and await self._looks_like_captcha(page):
+                    return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
 
             if await self._looks_like_login(page) and not phones:
                 self.traffic.record(
@@ -514,6 +527,12 @@ class BrowserSession:
         text = await self._safe_text(page)
         return any(marker in text for marker in LOGIN_MARKERS)
 
+    def _body_looks_like_captcha(self, body: str | None) -> bool:
+        text = (body or "").lower()
+        if not text:
+            return False
+        return any(marker.lower() in text for marker in CAPTCHA_MARKERS)
+
     async def _looks_like_captcha(self, page: Any) -> bool:
         url = (page.url or "").lower()
         if any(marker in url for marker in ("captcha", "challenge", "cdn-cgi")):
@@ -527,14 +546,15 @@ class BrowserSession:
         try:
             hit = await page.locator(
                 "iframe[src*='recaptcha'], iframe[src*='hcaptcha'], iframe[src*='captcha'], "
-                "#challenge-form, .cf-challenge, [class*='captcha'], [id*='captcha']"
+                "#challenge-form, .cf-challenge, [class*='captcha'], [id*='captcha'], "
+                "[class*='challenge'], [data-testid*='captcha']"
             ).count()
             if hit:
                 return True
         except Exception:
             pass
-        text = (await self._safe_text(page)).lower()
-        return any(marker.lower() in text for marker in CAPTCHA_MARKERS)
+        text = await self._safe_text(page)
+        return self._body_looks_like_captcha(text)
 
     async def _safe_text(self, page: Any) -> str:
         try:
@@ -575,6 +595,8 @@ class BrowserPool:
         self.traffic = traffic or TrafficBuffer()
         self._sessions: dict[int, BrowserSession] = {}
         self._captcha_account_id: int | None = None
+        self._captcha_label: str | None = None
+        self._captcha_phone: str | None = None
         self.vnc_url = os.environ.get("VNC_URL", DEFAULT_VNC_URL).strip() or DEFAULT_VNC_URL
 
     def profile_dir(self, account_id: int) -> Path:
@@ -600,14 +622,25 @@ class BrowserPool:
         active = any(session.captcha_active for session in self._sessions.values())
         if not active:
             self._captcha_account_id = None
+            self._captcha_label = None
+            self._captcha_phone = None
         return {
             "active": active,
             "vnc_url": self.vnc_url,
             "account_id": self._captcha_account_id,
+            "account_label": self._captcha_label,
+            "account_phone": self._captcha_phone,
         }
 
-    def note_captcha(self, account_id: int) -> dict[str, Any]:
-        self._captcha_account_id = account_id
+    def note_captcha(
+        self,
+        account_id: int,
+        label: str | None = None,
+        phone: str | None = None,
+    ) -> dict[str, Any]:
+        self._captcha_account_id = int(account_id)
+        self._captcha_label = label
+        self._captcha_phone = phone
         return self.captcha_status()
 
     def resolve_captcha(self) -> dict[str, Any]:
@@ -615,6 +648,8 @@ class BrowserPool:
             if session.captcha_active:
                 session.resolve_captcha()
         self._captcha_account_id = None
+        self._captcha_label = None
+        self._captcha_phone = None
         return self.captcha_status()
 
     async def wait_captcha_resolved(self) -> None:
@@ -623,6 +658,8 @@ class BrowserPool:
                 await session.wait_captcha_resolved()
                 break
         self._captcha_account_id = None
+        self._captcha_label = None
+        self._captcha_phone = None
 
     async def close(self, account_id: int) -> None:
         session = self._sessions.pop(account_id, None)
