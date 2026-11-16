@@ -210,6 +210,23 @@ $("#open-browser-login").addEventListener("click", async () => {
   }
 });
 
+function showCaptchaBanner(payload) {
+  const banner = $("#captcha-banner");
+  const link = $("#captcha-vnc");
+  const active = Boolean(payload && payload.active);
+  banner.classList.toggle("hidden", !active);
+  if (payload && payload.vnc_url) link.href = payload.vnc_url;
+}
+
+$("#captcha-done").addEventListener("click", async () => {
+  try {
+    const result = await api("/api/browser/captcha/resolved", { method: "POST" });
+    showCaptchaBanner(result);
+  } catch (err) {
+    appendLog({ level: "error", message: err.message, created_at: new Date().toISOString() });
+  }
+});
+
 $("#send-code").addEventListener("click", async () => {
   const form = new FormData($("#account-form"));
   $("#account-msg").textContent = "در حال درخواست کد…";
@@ -312,6 +329,7 @@ function connect() {
     renderJobs();
   });
   source.addEventListener("account", () => api("/api/accounts").then(renderAccounts));
+  source.addEventListener("captcha", (event) => showCaptchaBanner(JSON.parse(event.data)));
   source.onerror = () => { source.close(); setTimeout(connect, 2000); };
 }
 
@@ -331,6 +349,7 @@ async function boot() {
   (await api("/api/logs")).forEach(appendLog);
   (await api("/api/traffic")).forEach(appendTraffic);
   renderAccounts(await api("/api/accounts"));
+  showCaptchaBanner(await api("/api/browser/captcha"));
   connect();
   const tab = (location.hash || "").replace("#", "");
   if (tab) {

@@ -224,6 +224,16 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             "message": "پنجره Chromium باز شد. یک‌بار در همان پنجره وارد دیوار شوید.",
         }
 
+    @app.get("/api/browser/captcha")
+    async def browser_captcha_status() -> dict[str, Any]:
+        return browser.captcha_status()
+
+    @app.post("/api/browser/captcha/resolved")
+    async def browser_captcha_resolved() -> dict[str, Any]:
+        status = browser.resolve_captcha()
+        hub.publish("captcha", status)
+        return {"ok": True, **status}
+
     @app.get("/api/events")
     async def events() -> StreamingResponse:
         queue = await hub.subscribe()

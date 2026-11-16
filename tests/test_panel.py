@@ -225,3 +225,21 @@ def test_open_browser_login_endpoint(tmp_path):
         assert result.status_code == 200
         assert result.json()["ok"] is True
         assert called
+
+
+def test_captcha_status_and_resolve(tmp_path):
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        idle = client.get("/api/browser/captcha")
+        assert idle.status_code == 200
+        assert idle.json()["active"] is False
+        assert "vnc" in idle.json()["vnc_url"]
+
+        app.state.browser.begin_captcha()
+        blocked = client.get("/api/browser/captcha").json()
+        assert blocked["active"] is True
+
+        resolved = client.post("/api/browser/captcha/resolved")
+        assert resolved.status_code == 200
+        assert resolved.json()["active"] is False
+        assert client.get("/api/browser/captcha").json()["active"] is False

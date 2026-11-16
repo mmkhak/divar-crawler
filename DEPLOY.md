@@ -24,7 +24,10 @@ BROWSER_HEADLESS=0
 DISPLAY=:99
 DATA_DIR=/app/data
 PORT=8000
+VNC_URL=https://divar2.pixlink.ir/vnc.html
 ```
+
+اگر کپچا بیاید، بنر قرمز در پنل ظاهر می‌شود: لینک VNC + دکمه «کپچا حل شد».
 
 5. پنل را پشت Basic Auth / فایروال بگذار؛ احراز هویت داخلی ندارد.
 

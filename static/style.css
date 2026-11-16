@@ -31,6 +31,34 @@ button.ghost { background: #efe8dc; color: var(--ink); }
 .tab { background: transparent; color: #f4f1ea; border: 1px solid #3d3832; }
 .tab.active { background: #f4f1ea; color: #1c1915; }
 .banner { background: #fff4e8; color: var(--warn); margin: 0; }
+.captcha-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 0.9rem 1.4rem;
+  background: #9b2335;
+  color: #fff8f7;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.captcha-banner.hidden { display: none; }
+.captcha-banner strong { display: block; font-size: 1.05rem; }
+.captcha-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.45rem 0.7rem;
+  border-radius: 8px;
+  background: #fff;
+  color: #9b2335;
+  text-decoration: none;
+  font-weight: 700;
+}
+.captcha-banner button { background: #1c1915; }
 .panel.hidden { display: none; }
 .card, .job, .account {
   background: var(--card);

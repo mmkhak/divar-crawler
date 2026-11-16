@@ -10,6 +10,7 @@ services:
       DISPLAY: ":99"
       DATA_DIR: /app/data
       PORT: "8000"
+      VNC_URL: "https://divar2.pixlink.ir/vnc.html"
     volumes:
       - divar-data:/app/data
     restart: unless-stopped

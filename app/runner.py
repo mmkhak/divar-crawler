@@ -300,6 +300,18 @@ class JobManager:
             except Exception as exc:
                 self._log(job_id, f"خطای شماره مرورگر: {exc}", "warn")
                 return
+            if outcome.get("needs_captcha"):
+                status = self.browser.captcha_status()
+                self.hub.publish("captcha", status)
+                self._log(
+                    job_id,
+                    "کپچا آمد — VNC را باز کن، حل کن، بعد در پنل «کپچا حل شد» را بزن",
+                    "error",
+                )
+                await self.browser.wait_captcha_resolved()
+                self.hub.publish("captcha", self.browser.captcha_status())
+                self._log(job_id, "کپچا رفع شد؛ ادامه دریافت شماره")
+                continue
             if outcome.get("needs_login"):
                 self._log(
                     job_id,
