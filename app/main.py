@@ -97,6 +97,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def _startup() -> None:
+        db.release_phone_claims()
         manager.resume_interrupted()
 
     @app.get("/")

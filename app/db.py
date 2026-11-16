@@ -294,6 +294,43 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def claim_pending_phone(self, job_id: int) -> dict[str, Any] | None:
+        """Atomically take one pending listing for a worker (status → working)."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM listings
+                   WHERE job_id=? AND phone_status='pending'
+                   ORDER BY id LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute(
+                "UPDATE listings SET phone_status='working' WHERE id=? AND phone_status='pending'",
+                (row["id"],),
+            )
+            self._conn.commit()
+            claimed = self._conn.execute(
+                "SELECT * FROM listings WHERE id=?", (row["id"],)
+            ).fetchone()
+        return dict(claimed) if claimed else None
+
+    def release_phone_claims(self, job_id: int | None = None) -> int:
+        """Put interrupted 'working' rows back to pending."""
+        with self._lock:
+            if job_id is None:
+                cur = self._conn.execute(
+                    "UPDATE listings SET phone_status='pending' WHERE phone_status='working'"
+                )
+            else:
+                cur = self._conn.execute(
+                    """UPDATE listings SET phone_status='pending'
+                       WHERE job_id=? AND phone_status='working'""",
+                    (job_id,),
+                )
+            self._conn.commit()
+            return cur.rowcount
+
     def query_listings(
         self,
         job_id: int | None = None,

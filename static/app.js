@@ -82,7 +82,12 @@ function renderJobs() {
 }
 
 function phoneStatusLabel(status) {
-  return { pending: "در صف شماره", skipped: "رد شد", empty: "بدون شماره" }[status] || "";
+  return {
+    pending: "در صف شماره",
+    working: "در حال گرفتن شماره",
+    skipped: "رد شد",
+    empty: "بدون شماره",
+  }[status] || "";
 }
 
 function statusLabel(status) {

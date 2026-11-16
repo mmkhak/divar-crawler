@@ -55,6 +55,7 @@ class JobManager:
             raise KeyError(job_id)
         if job["status"] == "done":
             self.db.update_job(job_id, query_index=0, page=0, pagination=None, query_done=0, error=None)
+        self.db.release_phone_claims(job_id)
         self._pause.setdefault(job_id, asyncio.Event()).set()
         self._stop[job_id] = asyncio.Event()
         existing = self._tasks.get(job_id)
@@ -130,96 +131,126 @@ class JobManager:
             return
         queries: list[str | None] = list(job["keywords"]) or [None]
         self._log(job_id, "شروع خزش")
+        search_done = asyncio.Event()
+        phone_task: asyncio.Task | None = None
         if job["fetch_phones"]:
-            await self._drain_phones(job_id)
-        while True:
-            job = self.db.get_job(job_id)
-            if not job or job["status"] in {"stopped"}:
-                return
-            if not await self._wait_controls(job_id):
-                self.db.set_status(job_id, "stopped")
-                self._emit_job(job_id)
-                return
-            index = job["query_index"]
-            if index >= len(queries):
-                await self._drain_phones(job_id)
-                leftover = self.db.pending_phones(job_id, limit=1)
-                if leftover:
-                    self._log(job_id, "صف شماره خالی نشد؛ کار را دوباره شروع کنید", "warn")
-                fresh = self.db.get_job(job_id)
-                if fresh and fresh["status"] == "running":
-                    self.db.set_status(job_id, "done")
-                    self._log(job_id, "کار تمام شد")
-                    self._emit_job(job_id)
-                return
-            query = queries[index]
-            if job["query_done"] or job["page"] >= job["max_pages"]:
-                self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
-                continue
-            label = query or "کل دسته"
-            body = build_search(job["city_id"], job["category"], query, job["pagination"])
-            await self.limiter.wait()
-            try:
-                status, payload, text = await self.client.search(body)
-            except Exception as exc:
-                self.limiter.backoff(8)
-                self._log(job_id, f"خطای شبکه در جستجو: {exc}", "warn")
-                await asyncio.sleep(3)
-                continue
-            if status in {403, 429} or status >= 500:
-                self.limiter.backoff(min(60, 5 * (2 if status == 429 else 1)))
-                self._log(job_id, f"جستجو با وضعیت {status} کند شد؛ عقب‌نشینی", "warn")
-                await asyncio.sleep(2)
-                continue
-            if status != 200 or payload is None:
-                self._log(job_id, f"جستجو ناموفق ({status})", "error")
-                self.db.set_status(job_id, "error", f"HTTP {status}")
-                self._emit_job(job_id)
-                return
-            rows = parse_search_rows(payload)
-            page_data, has_next = pagination_state(payload)
-            added = 0
-            for row in rows:
-                title_blob = " ".join(
-                    part for part in (row["title"], row["list_bottom"], row["price_text"]) if part
+            accounts = self._active_browser_accounts()
+            if accounts:
+                self._log(
+                    job_id,
+                    f"توزیع شماره روی {len(accounts)} اکانت به‌صورت همزمان با جستجو",
                 )
-                if not matches_keywords(title_blob, job["title_filter"]):
+                phone_task = asyncio.create_task(
+                    self._drain_phones(job_id, search_done=search_done)
+                )
+            else:
+                self._log(
+                    job_id,
+                    "هیچ اکانت Chromium فعالی نیست؛ فقط جستجو انجام می‌شود",
+                    "warn",
+                )
+        try:
+            while True:
+                job = self.db.get_job(job_id)
+                if not job or job["status"] in {"stopped"}:
+                    return
+                if not await self._wait_controls(job_id):
+                    self.db.set_status(job_id, "stopped")
+                    self._emit_job(job_id)
+                    return
+                index = job["query_index"]
+                if index >= len(queries):
+                    search_done.set()
+                    if phone_task is not None:
+                        await phone_task
+                        phone_task = None
+                    leftover = self.db.pending_phones(job_id, limit=1)
+                    if leftover:
+                        self._log(job_id, "صف شماره خالی نشد؛ کار را دوباره شروع کنید", "warn")
+                    fresh = self.db.get_job(job_id)
+                    if fresh and fresh["status"] == "running":
+                        self.db.set_status(job_id, "done")
+                        self._log(job_id, "کار تمام شد")
+                        self._emit_job(job_id)
+                    return
+                query = queries[index]
+                if job["query_done"] or job["page"] >= job["max_pages"]:
+                    self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
                     continue
-                record = {
-                    "token": row["token"],
-                    "title": row["title"],
-                    "district": row["district"],
-                    "price_text": row["price_text"],
-                    "snippet": snippet(row["list_bottom"] or row["title"]),
-                    "description": None,
-                    "phone": None,
-                    "phone_status": "pending" if job["fetch_phones"] else "none",
-                    "link": f"https://divar.ir/v/{row['token']}",
-                    "red_text": row["red_text"],
-                    "found_by": label,
-                }
-                saved, created = self.db.upsert_listing(job_id, record)
-                if created:
-                    added += 1
-                    self.hub.publish("listing", _public_listing(saved, job["name"]))
-                elif job["fetch_phones"] and saved.get("phone_status") == "none":
-                    saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
-                    self.hub.publish("listing", _public_listing(saved, job["name"]))
-                if _needs_detail(saved, job):
-                    await self._fetch_detail(job_id, saved, job)
-            new_page = job["page"] + 1
-            finished_query = (not has_next) or new_page >= job["max_pages"]
-            self.db.update_job(
-                job_id,
-                page=new_page,
-                pagination=page_data,
-                query_done=1 if finished_query else 0,
-            )
-            self._log(job_id, f"[{label}] صفحه {new_page}، تازه {added}، ردیف صفحه {len(rows)}")
-            self._emit_job(job_id)
-            if finished_query:
-                self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
-            await self._drain_phones(job_id, limit=5)
+                label = query or "کل دسته"
+                body = build_search(job["city_id"], job["category"], query, job["pagination"])
+                await self.limiter.wait()
+                try:
+                    status, payload, text = await self.client.search(body)
+                except Exception as exc:
+                    self.limiter.backoff(8)
+                    self._log(job_id, f"خطای شبکه در جستجو: {exc}", "warn")
+                    await asyncio.sleep(3)
+                    continue
+                if status in {403, 429} or status >= 500:
+                    self.limiter.backoff(min(60, 5 * (2 if status == 429 else 1)))
+                    self._log(job_id, f"جستجو با وضعیت {status} کند شد؛ عقب‌نشینی", "warn")
+                    await asyncio.sleep(2)
+                    continue
+                if status != 200 or payload is None:
+                    self._log(job_id, f"جستجو ناموفق ({status})", "error")
+                    self.db.set_status(job_id, "error", f"HTTP {status}")
+                    self._emit_job(job_id)
+                    return
+                rows = parse_search_rows(payload)
+                page_data, has_next = pagination_state(payload)
+                added = 0
+                for row in rows:
+                    title_blob = " ".join(
+                        part for part in (row["title"], row["list_bottom"], row["price_text"]) if part
+                    )
+                    if not matches_keywords(title_blob, job["title_filter"]):
+                        continue
+                    record = {
+                        "token": row["token"],
+                        "title": row["title"],
+                        "district": row["district"],
+                        "price_text": row["price_text"],
+                        "snippet": snippet(row["list_bottom"] or row["title"]),
+                        "description": None,
+                        "phone": None,
+                        "phone_status": "pending" if job["fetch_phones"] else "none",
+                        "link": f"https://divar.ir/v/{row['token']}",
+                        "red_text": row["red_text"],
+                        "found_by": label,
+                    }
+                    saved, created = self.db.upsert_listing(job_id, record)
+                    if created:
+                        added += 1
+                        self.hub.publish("listing", _public_listing(saved, job["name"]))
+                    elif job["fetch_phones"] and saved.get("phone_status") == "none":
+                        saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
+                        self.hub.publish("listing", _public_listing(saved, job["name"]))
+                    if _needs_detail(saved, job):
+                        await self._fetch_detail(job_id, saved, job)
+                new_page = job["page"] + 1
+                finished_query = (not has_next) or new_page >= job["max_pages"]
+                self.db.update_job(
+                    job_id,
+                    page=new_page,
+                    pagination=page_data,
+                    query_done=1 if finished_query else 0,
+                )
+                self._log(job_id, f"[{label}] صفحه {new_page}، تازه {added}، ردیف صفحه {len(rows)}")
+                self._emit_job(job_id)
+                if finished_query:
+                    self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
+        finally:
+            search_done.set()
+            if phone_task is not None and not phone_task.done():
+                try:
+                    await asyncio.wait_for(phone_task, timeout=600)
+                except asyncio.TimeoutError:
+                    phone_task.cancel()
+                    self.db.release_phone_claims(job_id)
+            elif job and job.get("fetch_phones") and phone_task is None:
+                # No workers were started (no accounts); leave pending as-is.
+                pass
 
     async def _fetch_detail(self, job_id: int, listing: dict[str, Any], job: dict[str, Any]) -> None:
         """Scrape listing text from Chromium. Never calls posts-v2/{token}."""
@@ -308,67 +339,54 @@ class JobManager:
         self._account_cursor = (index + 1) % len(accounts)
         return accounts[index]
 
-    async def _drain_phones(self, job_id: int, limit: int | None = None) -> None:
-        """Reveal phones with all active Chromium accounts in parallel."""
+    async def _drain_phones(
+        self,
+        job_id: int,
+        search_done: asyncio.Event | None = None,
+    ) -> None:
+        """One continuous worker per active account; they pull from a shared pending queue."""
         job = self.db.get_job(job_id)
         if not job or not job["fetch_phones"]:
             return
-        handled = 0
-        while limit is None or handled < limit:
-            if not await self._wait_controls(job_id):
-                return
-            accounts = self._active_browser_accounts()
-            if not accounts:
-                self._log(
-                    job_id,
-                    "هیچ اکانت Chromium فعالی نیست؛ از برگه حساب‌ها چند اکانت وصل کنید",
-                    "error",
-                )
-                return
-            batch = len(accounts)
-            if limit is not None:
-                batch = min(batch, limit - handled)
-            pending = self.db.pending_phones(job_id, limit=batch)
-            if not pending:
-                return
-            pairs: list[tuple[dict[str, Any], AccountView]] = []
-            for offset, listing in enumerate(pending):
-                account = accounts[(self._account_cursor + offset) % len(accounts)]
-                pairs.append((listing, account))
-            self._account_cursor = (self._account_cursor + len(pairs)) % len(accounts)
-            labels = [
-                (self.db.get_browser_account(account.id) or {}).get("phone")
-                or (self.db.get_browser_account(account.id) or {}).get("label")
-                or f"#{account.id}"
-                for _, account in pairs
-            ]
+        accounts = self._active_browser_accounts()
+        if not accounts:
             self._log(
                 job_id,
-                f"دریافت همزمان شماره با {len(pairs)} اکانت: {'، '.join(str(x) for x in labels)}",
+                "هیچ اکانت Chromium فعالی نیست؛ از برگه حساب‌ها چند اکانت وصل کنید",
+                "error",
             )
-            results = await asyncio.gather(
-                *[
-                    self._fetch_phone_with_account(job_id, listing, account)
-                    for listing, account in pairs
-                ],
-                return_exceptions=True,
-            )
-            progressed = 0
-            for result in results:
-                if isinstance(result, Exception):
-                    self._log(job_id, f"خطای موازی شماره: {result}", "warn")
-                    continue
-                if result == "stop":
+            return
+        labels = []
+        for account in accounts:
+            row = self.db.get_browser_account(account.id) or {}
+            labels.append(row.get("phone") or row.get("label") or f"#{account.id}")
+        self._log(job_id, f"ورکرهای شماره فعال: {'، '.join(str(x) for x in labels)}")
+
+        async def worker(account: AccountView) -> None:
+            while True:
+                if not await self._wait_controls(job_id):
                     return
-                if result in {"done", "empty"}:
-                    progressed += 1
-            if progressed == 0:
-                # Avoid tight loop when every worker only hit login/captcha retry.
-                await asyncio.sleep(1)
-                if limit is not None and handled == 0:
-                    # still allow captcha retries without burning the outer limit forever
+                row = self.db.get_browser_account(account.id)
+                if not row or not available(account_view_from_row(row), today_key()):
+                    return
+                listing = self.db.claim_pending_phone(job_id)
+                if listing is None:
+                    if search_done is None or search_done.is_set():
+                        return
+                    await asyncio.sleep(0.4)
                     continue
-            handled += progressed
+                result = await self._fetch_phone_with_account(job_id, listing, account)
+                if result == "stop":
+                    self.db.update_listing(listing["id"], phone_status="pending")
+                    return
+                if result in {"retry", "error"}:
+                    self.db.update_listing(listing["id"], phone_status="pending")
+                    latest = self.db.get_browser_account(account.id) or {}
+                    if latest.get("status") != "active":
+                        return
+                    await asyncio.sleep(0.5)
+
+        await asyncio.gather(*(worker(account) for account in accounts))
 
     async def _fetch_phone_with_account(
         self,
