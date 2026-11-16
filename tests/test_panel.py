@@ -241,7 +241,7 @@ def test_telegram_notify_captcha_message(monkeypatch):
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            sent["client_kwargs"] = kwargs
 
         async def __aenter__(self):
             return self
@@ -256,6 +256,7 @@ def test_telegram_notify_captcha_message(monkeypatch):
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
     monkeypatch.setattr(notify.httpx, "AsyncClient", FakeClient)
     ok = asyncio.get_event_loop().run_until_complete(
         notify.notify_captcha(
@@ -270,6 +271,7 @@ def test_telegram_notify_captcha_message(monkeypatch):
     assert sent["json"]["chat_id"] == "42"
     assert "کپچا" in sent["json"]["text"]
     assert "09120000000" in sent["json"]["text"]
+    assert sent["client_kwargs"].get("proxy") == "socks5://127.0.0.1:1080"
 
 
 def test_job_loop_toggle(tmp_path):

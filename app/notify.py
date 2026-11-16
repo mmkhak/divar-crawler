@@ -24,8 +24,12 @@ async def send_telegram(text: str) -> bool:
         "text": text,
         "disable_web_page_preview": True,
     }
+    proxy = (os.environ.get("TELEGRAM_PROXY") or "").strip() or None
     try:
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        kwargs: dict = {"timeout": 15.0, "trust_env": False}
+        if proxy:
+            kwargs["proxy"] = proxy
+        async with httpx.AsyncClient(**kwargs) as client:
             response = await client.post(url, json=payload)
         if response.status_code >= 400:
             log.warning("telegram notify failed: %s %s", response.status_code, response.text[:200])
