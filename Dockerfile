@@ -4,18 +4,23 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Tehran \
     DATA_DIR=/app/data \
     DISPLAY=:99 \
     ENABLE_VNC=1 \
     BROWSER_HEADLESS=0 \
     PORT=8000
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    xvfb \
-    fluxbox \
-    x11vnc \
-    novnc \
-    websockify \
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo "$TZ" > /etc/timezone \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        xvfb \
+        fluxbox \
+        x11vnc \
+        novnc \
+        websockify \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
