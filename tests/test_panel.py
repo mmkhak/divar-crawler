@@ -278,7 +278,7 @@ def test_telegram_notify_captcha_message(monkeypatch):
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
     monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
     monkeypatch.setattr(notify.httpx, "AsyncClient", FakeClient)
-    ok = asyncio.get_event_loop().run_until_complete(
+    ok = asyncio.run(
         notify.notify_captcha(
             account_label="A1",
             account_phone="09120000000",

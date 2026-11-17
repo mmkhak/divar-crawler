@@ -42,7 +42,7 @@
       </label>
       <label>نام کار (اختیاری) <input name="name" placeholder="خودکار از لینک" /></label>
       <div class="row">
-        <label>حداکثر صفحه <input name="max_pages" type="number" min="1" max="200" value="5" /></label>
+        <label>حداکثر اسکرول لیست (۰=نامحدود) <input name="max_pages" type="number" min="0" max="200" value="0" /></label>
         <label class="checks"><input type="checkbox" name="fetch_details" checked /> دریافت جزئیات</label>
         <label class="checks"><input type="checkbox" name="fetch_phones" checked /> دریافت شماره</label>
         <label class="checks"><input type="checkbox" name="loop" /> حلقه دائم (بعد از تمام شدن از اول)</label>
@@ -70,7 +70,7 @@
       <div class="row">
         <label>فیلتر عنوان <input name="title_filter" placeholder="سالن" /></label>
         <label>فیلتر توضیحات <input name="desc_filter" /></label>
-        <label>حداکثر صفحه <input name="max_pages" type="number" min="1" max="200" value="2" /></label>
+        <label>حداکثر صفحه (۰=نامحدود برای شماره) <input name="max_pages" type="number" min="0" max="200" value="0" /></label>
       </div>
       <div class="row checks">
         <label><input type="checkbox" name="fetch_details" checked /> دریافت جزئیات</label>
