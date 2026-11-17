@@ -4,6 +4,7 @@ const state = {
   sort: "created_at",
   direction: "desc",
   rows: new Map(),
+  vncUrl: "",
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -109,6 +110,15 @@ function browserStatusLabel(status) {
 }
 
 function renderBrowserAccounts(list) {
+  const hint = $("#accounts-hint");
+  if (hint) {
+    hint.innerHTML = state.vncUrl
+      ? "هر اکانت یک پروفایل جدا دارد. اکانت‌های وصل‌شده <strong>همزمان</strong> شماره می‌گیرند. برای لاگین: اول VNC، بعد «لاگین این اکانت»."
+      : "هر اکانت یک پروفایل جدا دارد. اکانت‌های وصل‌شده <strong>همزمان</strong> شماره می‌گیرند. برای لاگین: «لاگین این اکانت» را بزن و در پنجره Chromium وارد شو.";
+  }
+  const vncBtn = state.vncUrl
+    ? `<a class="button-link" href="${escapeHtml(state.vncUrl)}" target="_blank" rel="noopener">VNC</a>`
+    : "";
   $("#browser-account-list").innerHTML = list.map((account) => `
     <article class="account ${account.status === "captcha" ? "account-captcha" : ""}">
       <div>
@@ -142,7 +152,7 @@ function renderBrowserAccounts(list) {
         </div>
       </div>
       <div class="row">
-        <a class="button-link" href="https://divar2.pixlink.ir/vnc.html" target="_blank" rel="noopener">VNC</a>
+        ${vncBtn}
         <button type="button" data-test-proxy="${account.id}">تست پروکسی</button>
         <button type="button" data-regen-fp="${account.id}">بازتولید اثرانگشت</button>
         ${account.status === "captcha" ? `<button type="button" data-focus="${account.id}">نمایش کپچا</button>` : ""}
@@ -335,7 +345,7 @@ $("#browser-account-list").addEventListener("click", async (event) => {
       return;
     }
     if (btn.dataset.focus) {
-      msg.textContent = "در حال نمایش اکانت روی VNC…";
+      msg.textContent = state.vncUrl ? "در حال نمایش اکانت روی VNC…" : "در حال آوردن پنجره این اکانت…";
       const result = await api(`/api/browser-accounts/${btn.dataset.focus}/focus`, { method: "POST" });
       if (result.vnc_url) window.open(result.vnc_url, "_blank", "noopener");
       msg.textContent = result.message || "آماده.";
@@ -354,13 +364,17 @@ $("#browser-account-list").addEventListener("click", async (event) => {
       const result = await api(`/api/browser-accounts/${btn.dataset.verify}/verify`, { method: "POST" });
       if (result.needs_captcha) {
         showCaptchaBanner(result);
-        msg.textContent = "کپچا آمد؛ در VNC حل کن و دوباره تأیید بزن.";
+        msg.textContent = state.vncUrl
+          ? "کپچا آمد؛ در VNC حل کن و دوباره تأیید بزن."
+          : "کپچا آمد؛ در پنجره Chromium حل کن و دوباره تأیید بزن.";
       } else if (result.ok) {
         msg.textContent = result.account.phone
           ? `وصل شد: ${result.account.phone}`
           : "وصل شد.";
       } else {
-        msg.textContent = "هنوز لاگین نیست؛ در VNC وارد شو و دوباره تأیید کن.";
+        msg.textContent = state.vncUrl
+          ? "هنوز لاگین نیست؛ در VNC وارد شو و دوباره تأیید کن."
+          : "هنوز لاگین نیست؛ در پنجره Chromium وارد شو و دوباره تأیید کن.";
       }
       renderBrowserAccounts(await api("/api/browser-accounts"));
       return;
@@ -384,15 +398,26 @@ function showCaptchaBanner(payload) {
   const active = Boolean(payload && payload.active);
   banner.classList.toggle("hidden", !active);
   if (!payload) return;
-  if (payload.vnc_url) link.href = payload.vnc_url;
+  if (payload.vnc_url) {
+    state.vncUrl = payload.vnc_url;
+    link.href = payload.vnc_url;
+    link.classList.remove("hidden");
+  } else {
+    state.vncUrl = "";
+    link.classList.add("hidden");
+  }
   state.captchaAccountId = payload.account_id || null;
   const who = payload.account_phone || payload.account_label || (payload.account_id ? ("اکانت " + payload.account_id) : "");
   if (active && who) {
     title.textContent = `کپچا روی اکانت ${who}`;
-    detail.textContent = "VNC را باز کن، کپچای همین اکانت را حل کن، بعد «کپچا حل شد» را بزن. بقیه اکانت‌ها می‌توانند همزمان کار کنند.";
+    detail.textContent = state.vncUrl
+      ? "VNC را باز کن، کپچای همین اکانت را حل کن، بعد «کپچا حل شد» را بزن. بقیه اکانت‌ها می‌توانند همزمان کار کنند."
+      : "در پنجره Chromium کپچای همین اکانت را حل کن، بعد «کپچا حل شد» را بزن.";
   } else {
     title.textContent = "کپچا آمد";
-    detail.textContent = "اول VNC را باز کن و کپچا را روی همان اکانت حل کن، بعد «کپچا حل شد» را بزن.";
+    detail.textContent = state.vncUrl
+      ? "اول VNC را باز کن و کپچا را روی همان اکانت حل کن، بعد «کپچا حل شد» را بزن."
+      : "در پنجره Chromium کپچا را حل کن، بعد «کپچا حل شد» را بزن.";
   }
 }
 
@@ -499,8 +524,8 @@ async function boot() {
   paintRows();
   (await api("/api/logs")).forEach(appendLog);
   (await api("/api/traffic")).forEach(appendTraffic);
-  renderBrowserAccounts(await api("/api/browser-accounts"));
   showCaptchaBanner(await api("/api/browser/captcha"));
+  renderBrowserAccounts(await api("/api/browser-accounts"));
   connect();
   const tab = (location.hash || "").replace("#", "");
   if (tab) {

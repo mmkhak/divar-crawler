@@ -24,10 +24,10 @@
   <div id="captcha-banner" class="captcha-banner hidden" role="alert">
     <div>
       <strong id="captcha-title">کپچا آمد</strong>
-      <span id="captcha-detail">اول VNC را باز کن و کپچا را روی همان اکانت حل کن، بعد «کپچا حل شد» را بزن.</span>
+      <span id="captcha-detail">در پنجره Chromium کپچا را حل کن، بعد «کپچا حل شد» را بزن.</span>
     </div>
     <div class="captcha-actions">
-      <a id="captcha-vnc" class="button-link" href="https://divar2.pixlink.ir/vnc.html" target="_blank" rel="noopener">باز کردن VNC</a>
+      <a id="captcha-vnc" class="button-link hidden" href="#" target="_blank" rel="noopener">باز کردن VNC</a>
       <button type="button" id="captcha-focus" class="ghost">نمایش همین اکانت</button>
       <button type="button" id="captcha-done">کپچا حل شد — ادامه</button>
     </div>
@@ -121,7 +121,7 @@
   <section id="accounts" class="panel hidden">
     <form id="browser-account-form" class="card">
       <h2>اکانت‌های Chromium</h2>
-      <p class="muted">هر اکانت یک پروفایل جدا دارد. اکانت‌های وصل‌شده <strong>همزمان</strong> شماره می‌گیرند. برای لاگین: اول VNC، بعد «لاگین این اکانت» (پنجره‌های دیگر موقتاً بسته می‌شوند).</p>
+      <p class="muted" id="accounts-hint">هر اکانت یک پروفایل جدا دارد. اکانت‌های وصل‌شده <strong>همزمان</strong> شماره می‌گیرند. برای لاگین: «لاگین این اکانت» را بزن و در پنجره Chromium وارد شو.</p>
       <div class="row">
         <label>نام اکانت <input name="label" placeholder="مثلاً اکانت ۱" /></label>
         <label>سقف روزانه شماره <input name="daily_cap" type="number" value="80" min="1" max="150" /></label>
