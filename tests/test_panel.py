@@ -170,16 +170,26 @@ def test_confirm_saves_token_without_leaking_it(tmp_path):
         assert secret["proxy"] == "http://127.0.0.1:8888"
 
 
-def test_fetch_phones_queues_even_without_details_flag(tmp_path):
+def test_fetch_phones_human_browse_opens_ads_one_by_one(tmp_path):
     app = create_app(tmp_path)
-    pages = [_page("phoneTok1", False, 1)]
-    revealed = []
+    opened = []
+    scrolls = {"n": 0}
 
-    async def search(body):
-        return 200, pages.pop(0), ""
+    async def open_search_list(list_url):
+        opened.append(("list", list_url))
+        return {}
 
-    async def reveal_phone(token):
-        revealed.append(token)
+    async def scroll_search_list():
+        scrolls["n"] += 1
+        return {}
+
+    async def collect_list_ads():
+        if scrolls["n"] <= 1:
+            return [{"token": "phoneTok1", "title": "آگهی تست", "href": "https://divar.ir/v/phoneTok1"}]
+        return []
+
+    async def open_ad_from_list(token, list_url):
+        opened.append(("ad", token))
         return {
             "phones": ["09120000000"],
             "needs_login": False,
@@ -195,12 +205,14 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         ).json()
         app.state.db.update_browser_account(account["id"], status="active", phone="09121111111")
         session = app.state.browsers.get(account["id"])
-        session.reveal_phone = reveal_phone
+        session.open_search_list = open_search_list
+        session.scroll_search_list = scroll_search_list
+        session.collect_list_ads = collect_list_ads
+        session.open_ad_from_list = open_ad_from_list
         app.state.db.update_settings(
             {"anon_rps": "20", "default_daily_cap": "50", "delay_min": "0.01", "delay_max": "0.01"}
         )
         app.state.manager.refresh_rate()
-        app.state.manager.client.search = search
         created = client.post(
             "/api/jobs",
             json={
@@ -215,7 +227,7 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         job_id = created.json()["id"]
         client.post(f"/api/jobs/{job_id}/start")
         status = "running"
-        for _ in range(80):
+        for _ in range(120):
             status = client.get("/api/jobs").json()[0]["status"]
             if status in {"done", "error"}:
                 break
@@ -225,7 +237,8 @@ def test_fetch_phones_queues_even_without_details_flag(tmp_path):
         assert rows[0]["phone"] == "09120000000"
         assert rows[0]["phone_status"] == "done"
         assert rows[0]["description"] == "توضیح از صفحه"
-        assert revealed == ["phoneTok1"]
+        assert ("ad", "phoneTok1") in opened
+        assert any(item[0] == "list" for item in opened)
 
 
 def test_telegram_notify_captcha_message(monkeypatch):

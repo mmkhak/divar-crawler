@@ -1,5 +1,7 @@
-"""Background crawl workers. Search stays on the anonymous API;
-listing details and phones come from Playwright Chromium (no posts-v2 token API).
+"""Background crawl workers.
+
+With fetch_phones: Chromium opens the Divar list URL, scrolls, opens ads one by one,
+and reveals contact — like a person. Without phones: anonymous search API only.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from app.divar.parse import (
     snippet,
 )
 from app.divar.traffic import TrafficBuffer
+from app.divar.urls import build_search_list_url
 from app.hub import EventHub
 from app.notify import notify_captcha
 
@@ -132,153 +135,362 @@ class JobManager:
         job = self.db.get_job(job_id)
         if not job:
             return
-        queries: list[str | None] = list(job["keywords"]) or [None]
-        self._log(job_id, "شروع خزش")
-        search_done = asyncio.Event()
-        phone_task: asyncio.Task | None = None
-        if job["fetch_phones"]:
-            accounts = self._active_browser_accounts()
-            if accounts:
-                self._log(
-                    job_id,
-                    f"توزیع شماره روی {len(accounts)} اکانت به‌صورت همزمان با جستجو",
-                )
-                phone_task = asyncio.create_task(
-                    self._drain_phones(job_id, search_done=search_done)
-                )
-            else:
-                self._log(
-                    job_id,
-                    "هیچ اکانت Chromium فعالی نیست؛ فقط جستجو انجام می‌شود",
-                    "warn",
-                )
-        try:
-            while True:
-                job = self.db.get_job(job_id)
-                if not job or job["status"] in {"stopped"}:
-                    return
+        if job.get("fetch_phones"):
+            await self._crawl_human_browse(job_id)
+            return
+        await self._crawl_api_search(job_id)
+
+    async def _crawl_human_browse(self, job_id: int) -> None:
+        """Open list URL in Chromium, scroll, open each ad, take contact, next."""
+        self._log(job_id, "شروع خزش انسانی (لیست → اسکرول → آگهی → تماس)")
+        while True:
+            job = self.db.get_job(job_id)
+            if not job or job["status"] in {"stopped"}:
+                return
+            if not await self._wait_controls(job_id):
+                self.db.set_status(job_id, "stopped")
+                self._emit_job(job_id)
+                return
+            account = self._pick_browser_account()
+            if account is None:
+                self.db.set_status(job_id, "error", "no browser account")
+                self._log(job_id, "هیچ اکانت Chromium فعالی نیست", "error")
+                self._emit_job(job_id)
+                return
+            list_url = self._list_url_for_job(job)
+            self._log(job_id, f"باز کردن لیست: {list_url}")
+            session = self.browsers.get(account.id)
+            opened = await session.open_search_list(list_url)
+            if opened.get("needs_captcha"):
+                await self._handle_account_captcha(job_id, account.id, session=session)
+                continue
+            if opened.get("needs_login"):
+                self.db.update_browser_account(account.id, status="needs_login", last_error="login required")
+                self.hub.publish("browser_account", self.db.get_browser_account(account.id))
+                self._log(job_id, "اکانت لاگین نیست", "error")
+                return
+            if opened.get("error"):
+                self._log(job_id, f"باز کردن لیست ناموفق: {opened['error']}", "warn")
+                await asyncio.sleep(3)
+                continue
+
+            seen: set[str] = set()
+            empty_scrolls = 0
+            page_rounds = 0
+            max_pages = max(1, int(job.get("max_pages") or 5))
+            switch_account = False
+            list_finished = False
+            while page_rounds < max_pages:
                 if not await self._wait_controls(job_id):
                     self.db.set_status(job_id, "stopped")
                     self._emit_job(job_id)
                     return
-                index = job["query_index"]
-                if index >= len(queries):
-                    search_done.set()
-                    if phone_task is not None:
-                        await phone_task
-                        phone_task = None
-                    leftover = self.db.pending_phones(job_id, limit=1)
-                    if leftover:
-                        self._log(job_id, "صف شماره خالی نشد؛ کار را دوباره شروع کنید", "warn")
-                    fresh = self.db.get_job(job_id)
-                    if (
-                        fresh
-                        and fresh.get("loop")
-                        and fresh["status"] == "running"
-                        and await self._wait_controls(job_id)
-                    ):
-                        self.db.update_job(
-                            job_id,
-                            query_index=0,
-                            page=0,
-                            pagination=None,
-                            query_done=0,
-                            error=None,
-                        )
-                        self._log(job_id, "حلقه دائم: تمام شد؛ از اول دوباره شروع می‌شود")
-                        self._emit_job(job_id)
-                        search_done = asyncio.Event()
-                        if fresh.get("fetch_phones"):
-                            accounts = self._active_browser_accounts()
-                            if accounts:
-                                phone_task = asyncio.create_task(
-                                    self._drain_phones(job_id, search_done=search_done)
-                                )
-                        await asyncio.sleep(3)
-                        continue
-                    if fresh and fresh["status"] == "running":
-                        self.db.set_status(job_id, "done")
-                        self._log(job_id, "کار تمام شد")
-                        self._emit_job(job_id)
-                    return
-                query = queries[index]
-                if job["query_done"] or job["page"] >= job["max_pages"]:
-                    self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
+                job = self.db.get_job(job_id) or job
+                account_row = self.db.get_browser_account(account.id)
+                if not account_row or not available(account_view_from_row(account_row), today_key()):
+                    self._log(job_id, "اکانت از دسترس خارج شد؛ تعویض", "warn")
+                    switch_account = True
+                    break
+
+                scrolled = await session.scroll_search_list()
+                if scrolled.get("needs_captcha"):
+                    await self._handle_account_captcha(job_id, account.id, session=session)
+                    await session.open_search_list(list_url)
                     continue
-                label = query or "کل دسته"
-                body = build_search(job["city_id"], job["category"], query, job["pagination"])
-                await self.limiter.wait()
-                try:
-                    status, payload, text = await self.client.search(body)
-                except Exception as exc:
-                    self.limiter.backoff(8)
-                    self._log(job_id, f"خطای شبکه در جستجو: {exc}", "warn")
-                    await asyncio.sleep(3)
-                    continue
-                if status in {403, 429} or status >= 500:
-                    self.limiter.backoff(min(60, 5 * (2 if status == 429 else 1)))
-                    self._log(job_id, f"جستجو با وضعیت {status} کند شد؛ عقب‌نشینی", "warn")
-                    await asyncio.sleep(2)
-                    continue
-                if status != 200 or payload is None:
-                    self._log(job_id, f"جستجو ناموفق ({status})", "error")
-                    self.db.set_status(job_id, "error", f"HTTP {status}")
+
+                ads = await session.collect_list_ads()
+                fresh_ads = [ad for ad in ads if ad["token"] not in seen]
+                if not fresh_ads:
+                    empty_scrolls += 1
+                    page_rounds += 1
+                    self.db.update_job(job_id, page=page_rounds)
                     self._emit_job(job_id)
-                    return
-                rows = parse_search_rows(payload)
-                page_data, has_next = pagination_state(payload)
+                    if empty_scrolls >= 4:
+                        self._log(job_id, "آگهی تازه‌ای بعد از اسکرول پیدا نشد")
+                        list_finished = True
+                        break
+                    continue
+                empty_scrolls = 0
+                page_rounds += 1
+                self.db.update_job(job_id, page=page_rounds)
                 added = 0
-                for row in rows:
-                    title_blob = " ".join(
-                        part for part in (row["title"], row["list_bottom"], row["price_text"]) if part
-                    )
-                    if not matches_keywords(title_blob, job["title_filter"]):
+                for ad in fresh_ads:
+                    if not await self._wait_controls(job_id):
+                        self.db.set_status(job_id, "stopped")
+                        self._emit_job(job_id)
+                        return
+                    seen.add(ad["token"])
+                    title = ad.get("title") or ""
+                    if not matches_keywords(title, job.get("title_filter") or []):
                         continue
                     record = {
-                        "token": row["token"],
-                        "title": row["title"],
-                        "district": row["district"],
-                        "price_text": row["price_text"],
-                        "snippet": snippet(row["list_bottom"] or row["title"]),
+                        "token": ad["token"],
+                        "title": title,
+                        "district": "",
+                        "price_text": "",
+                        "snippet": snippet(title),
                         "description": None,
                         "phone": None,
-                        "phone_status": "pending" if job["fetch_phones"] else "none",
-                        "link": f"https://divar.ir/v/{row['token']}",
-                        "red_text": row["red_text"],
-                        "found_by": label,
+                        "phone_status": "pending",
+                        "link": ad.get("href") or f"https://divar.ir/v/{ad['token']}",
+                        "red_text": "",
+                        "found_by": "browser-list",
                     }
                     saved, created = self.db.upsert_listing(job_id, record)
                     if created:
                         added += 1
                         self.hub.publish("listing", _public_listing(saved, job["name"]))
-                    elif job["fetch_phones"] and saved.get("phone_status") == "none":
+                    elif saved.get("phone_status") in {"done", "empty", "skipped"}:
+                        continue
+                    else:
                         saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
-                        self.hub.publish("listing", _public_listing(saved, job["name"]))
-                    if _needs_detail(saved, job):
-                        await self._fetch_detail(job_id, saved, job)
-                new_page = job["page"] + 1
-                finished_query = (not has_next) or new_page >= job["max_pages"]
+
+                    result = await self._human_open_ad(
+                        job_id, saved, account, session, list_url
+                    )
+                    if result == "stop":
+                        self.db.set_status(job_id, "stopped")
+                        self._emit_job(job_id)
+                        return
+                    if result == "switch_account":
+                        switch_account = True
+                        break
+                    if result == "reopen_list":
+                        await session.open_search_list(list_url)
+                if switch_account:
+                    break
+                self._log(
+                    job_id,
+                    f"اسکرول {page_rounds}/{max_pages} · تازه در لیست {added} · کل دیده {len(seen)}",
+                )
+                self._emit_job(job_id)
+            else:
+                list_finished = True
+
+            if switch_account:
+                await asyncio.sleep(1)
+                continue
+
+            fresh = self.db.get_job(job_id)
+            if (
+                fresh
+                and fresh.get("loop")
+                and fresh["status"] == "running"
+                and await self._wait_controls(job_id)
+            ):
                 self.db.update_job(
                     job_id,
-                    page=new_page,
-                    pagination=page_data,
-                    query_done=1 if finished_query else 0,
+                    query_index=0,
+                    page=0,
+                    pagination=None,
+                    query_done=0,
+                    error=None,
                 )
-                self._log(job_id, f"[{label}] صفحه {new_page}، تازه {added}، ردیف صفحه {len(rows)}")
+                self._log(job_id, "حلقه دائم: لیست از اول دوباره")
                 self._emit_job(job_id)
-                if finished_query:
-                    self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
-        finally:
-            search_done.set()
-            if phone_task is not None and not phone_task.done():
-                try:
-                    await asyncio.wait_for(phone_task, timeout=600)
-                except asyncio.TimeoutError:
-                    phone_task.cancel()
-                    self.db.release_phone_claims(job_id)
-            elif job and job.get("fetch_phones") and phone_task is None:
-                # No workers were started (no accounts); leave pending as-is.
-                pass
+                await asyncio.sleep(3)
+                continue
+            if fresh and fresh["status"] == "running":
+                self.db.set_status(job_id, "done")
+                self._log(job_id, "کار تمام شد" + (" · لیست تمام" if list_finished else ""))
+                self._emit_job(job_id)
+            return
+
+    def _list_url_for_job(self, job: dict[str, Any]) -> str:
+        if job.get("source_url"):
+            return str(job["source_url"])
+        city_slug = "iran"
+        for city in load_cities(self.data_dir):
+            if str(city.get("id")) == str(job.get("city_id")):
+                city_slug = str(city.get("slug") or city_slug)
+                break
+            if str(city.get("name")) == str(job.get("city_name") or ""):
+                city_slug = str(city.get("slug") or city_slug)
+                break
+        if str(job.get("city_id")) == "715" or str(job.get("city_name") or "").find("ایران") >= 0:
+            city_slug = "iran"
+        return build_search_list_url(
+            city_slug=city_slug,
+            category=str(job.get("category") or "root"),
+            keywords=list(job.get("keywords") or []),
+        )
+
+    async def _human_open_ad(
+        self,
+        job_id: int,
+        listing: dict[str, Any],
+        account: AccountView,
+        session: Any,
+        list_url: str,
+    ) -> str:
+        row = self.db.get_browser_account(account.id) or {}
+        delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
+        delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
+        wait = jitter(delay_min, delay_max)
+        label = row.get("phone") or row.get("label") or f"#{account.id}"
+        self._log(job_id, f"باز کردن آگهی {listing['token']} با {label} بعد از {wait:.0f}ث")
+        await asyncio.sleep(wait)
+        if not await self._wait_controls(job_id):
+            return "stop"
+        try:
+            outcome = await session.open_ad_from_list(listing["token"], list_url)
+        except Exception as exc:
+            self._log(job_id, f"خطای باز کردن آگهی: {exc}", "warn")
+            self.db.update_listing(listing["id"], phone_status="pending")
+            return "error"
+        if outcome.get("needs_captcha"):
+            await self._handle_account_captcha(job_id, account.id, session=session)
+            self.db.update_listing(listing["id"], phone_status="pending")
+            return "reopen_list"
+        if outcome.get("needs_login"):
+            self.db.update_browser_account(account.id, status="needs_login", last_error="login required")
+            self.hub.publish("browser_account", self.db.get_browser_account(account.id))
+            self._log(job_id, f"اکانت {label} لاگین نیست", "warn")
+            self.db.update_listing(listing["id"], phone_status="pending")
+            return "switch_account"
+
+        phones = list(outcome.get("phones") or [])
+        description = outcome.get("description") or listing.get("description") or ""
+        job = self.db.get_job(job_id) or {}
+        if job.get("desc_filter") and description:
+            if not matches_keywords(description, job["desc_filter"]):
+                updated = self.db.update_listing(
+                    listing["id"],
+                    description=description,
+                    snippet=snippet(description or listing.get("snippet") or ""),
+                    phone_status="skipped",
+                )
+                self.hub.publish("listing", _public_listing(updated, job.get("name") or ""))
+                return "ok"
+        if not phones:
+            phones = canonical_phones(description)
+        joined = "، ".join(phones)
+        phone_status = "done" if phones else "empty"
+        updates: dict[str, Any] = {"phone": joined, "phone_status": phone_status}
+        if description:
+            updates["description"] = description
+            updates["snippet"] = snippet(description or listing.get("snippet") or "")
+        if outcome.get("specs"):
+            updates["specs_json"] = json.dumps(outcome["specs"], ensure_ascii=False)
+        updated = self.db.update_listing(listing["id"], **updates)
+        self.db.bump_browser_account_view(account.id)
+        self.hub.publish("browser_account", self.db.get_browser_account(account.id))
+        if phones:
+            self._log(job_id, f"شماره {listing['token']}: {joined} · {label}")
+        else:
+            self._log(job_id, f"شماره‌ای برای {listing['token']} نبود ({outcome.get('error') or 'خالی'})", "warn")
+        self.hub.publish("listing", _public_listing(updated, job.get("name") or ""))
+        if not available(account_view_from_row(self.db.get_browser_account(account.id) or {}), today_key()):
+            return "switch_account"
+        return "ok"
+
+    async def _crawl_api_search(self, job_id: int) -> None:
+        job = self.db.get_job(job_id)
+        if not job:
+            return
+        queries: list[str | None] = list(job["keywords"]) or [None]
+        self._log(job_id, "شروع خزش (API جستجو)")
+        while True:
+            job = self.db.get_job(job_id)
+            if not job or job["status"] in {"stopped"}:
+                return
+            if not await self._wait_controls(job_id):
+                self.db.set_status(job_id, "stopped")
+                self._emit_job(job_id)
+                return
+            index = job["query_index"]
+            if index >= len(queries):
+                fresh = self.db.get_job(job_id)
+                if (
+                    fresh
+                    and fresh.get("loop")
+                    and fresh["status"] == "running"
+                    and await self._wait_controls(job_id)
+                ):
+                    self.db.update_job(
+                        job_id,
+                        query_index=0,
+                        page=0,
+                        pagination=None,
+                        query_done=0,
+                        error=None,
+                    )
+                    self._log(job_id, "حلقه دائم: تمام شد؛ از اول دوباره شروع می‌شود")
+                    self._emit_job(job_id)
+                    await asyncio.sleep(3)
+                    continue
+                if fresh and fresh["status"] == "running":
+                    self.db.set_status(job_id, "done")
+                    self._log(job_id, "کار تمام شد")
+                    self._emit_job(job_id)
+                return
+            query = queries[index]
+            if job["query_done"] or job["page"] >= job["max_pages"]:
+                self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
+                continue
+            label = query or "کل دسته"
+            body = build_search(job["city_id"], job["category"], query, job["pagination"])
+            await self.limiter.wait()
+            try:
+                status, payload, text = await self.client.search(body)
+            except Exception as exc:
+                self.limiter.backoff(8)
+                self._log(job_id, f"خطای شبکه در جستجو: {exc}", "warn")
+                await asyncio.sleep(3)
+                continue
+            if status in {403, 429} or status >= 500:
+                self.limiter.backoff(min(60, 5 * (2 if status == 429 else 1)))
+                self._log(job_id, f"جستجو با وضعیت {status} کند شد؛ عقب‌نشینی", "warn")
+                await asyncio.sleep(2)
+                continue
+            if status != 200 or payload is None:
+                self._log(job_id, f"جستجو ناموفق ({status})", "error")
+                self.db.set_status(job_id, "error", f"HTTP {status}")
+                self._emit_job(job_id)
+                return
+            rows = parse_search_rows(payload)
+            page_data, has_next = pagination_state(payload)
+            added = 0
+            for row in rows:
+                title_blob = " ".join(
+                    part for part in (row["title"], row["list_bottom"], row["price_text"]) if part
+                )
+                if not matches_keywords(title_blob, job["title_filter"]):
+                    continue
+                record = {
+                    "token": row["token"],
+                    "title": row["title"],
+                    "district": row["district"],
+                    "price_text": row["price_text"],
+                    "snippet": snippet(row["list_bottom"] or row["title"]),
+                    "description": None,
+                    "phone": None,
+                    "phone_status": "pending" if job["fetch_phones"] else "none",
+                    "link": f"https://divar.ir/v/{row['token']}",
+                    "red_text": row["red_text"],
+                    "found_by": label,
+                }
+                saved, created = self.db.upsert_listing(job_id, record)
+                if created:
+                    added += 1
+                    self.hub.publish("listing", _public_listing(saved, job["name"]))
+                elif job["fetch_phones"] and saved.get("phone_status") == "none":
+                    saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
+                    self.hub.publish("listing", _public_listing(saved, job["name"]))
+                if _needs_detail(saved, job):
+                    await self._fetch_detail(job_id, saved, job)
+            new_page = job["page"] + 1
+            finished_query = (not has_next) or new_page >= job["max_pages"]
+            self.db.update_job(
+                job_id,
+                page=new_page,
+                pagination=page_data,
+                query_done=1 if finished_query else 0,
+            )
+            self._log(job_id, f"[{label}] صفحه {new_page}، تازه {added}، ردیف صفحه {len(rows)}")
+            self._emit_job(job_id)
+            if finished_query:
+                self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
 
     async def _fetch_detail(self, job_id: int, listing: dict[str, Any], job: dict[str, Any]) -> None:
         """Scrape listing text from Chromium. Never calls posts-v2/{token}."""

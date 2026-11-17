@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 PRELOADED_RE = re.compile(
     r"window\.__PRELOADED_STATE__\s*=\s*(\{.+?\})\s*;?\s*</script>",
@@ -80,6 +80,29 @@ def extract_search_from_preloaded(html: str) -> dict[str, Any] | None:
         "category": str(category),
         "keywords": keywords,
     }
+
+
+def build_search_list_url(
+    *,
+    city_slug: str,
+    category: str = "root",
+    keywords: list[str] | None = None,
+    source_url: str | None = None,
+) -> str:
+    """Build the Divar /s/... page a human would open in the browser."""
+    if source_url and source_url.strip():
+        return source_url.strip()
+    slug = (city_slug or "").strip().strip("/") or "iran"
+    cat = (category or "root").strip().strip("/")
+    if cat and cat != "root":
+        path = f"/s/{slug}/{cat}"
+    else:
+        path = f"/s/{slug}"
+    query = ""
+    words = [w.strip() for w in (keywords or []) if w and str(w).strip()]
+    if words:
+        query = f"?q={quote(words[0])}"
+    return f"https://divar.ir{path}{query}"
 
 
 def resolve_city_slug(cities: list[dict[str, Any]], slug: str) -> dict[str, str] | None:

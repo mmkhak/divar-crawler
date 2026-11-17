@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     fetch_details INTEGER NOT NULL DEFAULT 1,
     fetch_phones INTEGER NOT NULL DEFAULT 0,
     loop INTEGER NOT NULL DEFAULT 0,
+    source_url TEXT,
     status TEXT NOT NULL DEFAULT 'paused',
     query_index INTEGER NOT NULL DEFAULT 0,
     page INTEGER NOT NULL DEFAULT 0,
@@ -132,6 +133,8 @@ class Database:
         cols = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
         if "loop" not in cols:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN loop INTEGER NOT NULL DEFAULT 0")
+        if "source_url" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -187,8 +190,8 @@ class Database:
             cur = self._conn.execute(
                 """INSERT INTO jobs(
                     name, category, keywords, city_id, city_name, title_filter, desc_filter,
-                    max_pages, fetch_details, fetch_phones, loop, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, ?)""",
+                    max_pages, fetch_details, fetch_phones, loop, source_url, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, ?)""",
                 (
                     fields["name"],
                     fields["category"],
@@ -201,6 +204,7 @@ class Database:
                     1 if fields["fetch_details"] else 0,
                     1 if fields["fetch_phones"] else 0,
                     1 if fields.get("loop") else 0,
+                    (fields.get("source_url") or None),
                     stamp,
                     stamp,
                 ),
@@ -555,6 +559,7 @@ def _job(row: sqlite3.Row) -> dict[str, Any]:
     data["fetch_details"] = bool(data["fetch_details"])
     data["fetch_phones"] = bool(data["fetch_phones"])
     data["loop"] = bool(data.get("loop") or 0)
+    data["source_url"] = data.get("source_url") or None
     data["query_done"] = bool(data["query_done"])
     return data
 

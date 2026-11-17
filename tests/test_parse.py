@@ -103,6 +103,7 @@ def test_auth_token_and_phone_normalize():
 
 def test_parse_divar_search_url_and_aliases():
     from app.divar.urls import (
+        build_search_list_url,
         extract_search_from_preloaded,
         parse_divar_search_url,
         resolve_category_slug,
@@ -114,6 +115,14 @@ def test_parse_divar_search_url_and_aliases():
     assert parsed["category_slug"] == "beauty-services"
     assert resolve_category_slug([], "beauty-services") == "beauty-and-haircare"
     assert resolve_city_slug([], "iran")["id"] == "715"
+    assert (
+        build_search_list_url(city_slug="tehran", category="beauty-and-haircare", keywords=["کاشت"])
+        == "https://divar.ir/s/tehran/beauty-and-haircare?q=%DA%A9%D8%A7%D8%B4%D8%AA"
+    )
+    assert build_search_list_url(
+        city_slug="x",
+        source_url="https://divar.ir/s/iran/beauty-services",
+    ) == "https://divar.ir/s/iran/beauty-services"
 
     html = """
     <script>window.__PRELOADED_STATE__ = {

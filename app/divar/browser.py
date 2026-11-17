@@ -1,7 +1,9 @@
-"""Playwright Chromium session used only to reveal listing phone numbers."""
+"""Playwright Chromium session: human-like list browse + phone reveal."""
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -226,6 +228,7 @@ class BrowserSession:
                 }
             page = self._page
             assert page is not None
+            await self._human_browse_page(page)
             fields = await self._scrape_listing_fields(page)
             self.traffic.record(
                 "BROWSER",
@@ -241,11 +244,124 @@ class BrowserSession:
                 "error": None if fields.get("description") else "empty",
             }
 
-    async def reveal_phone(self, token: str) -> dict[str, Any]:
-        """Open listing page, click contact, return phones.
+    async def open_search_list(self, list_url: str) -> dict[str, Any]:
+        """Open a Divar /s/... search page like a person would."""
+        async with self._get_lock():
+            await self.ensure()
+            assert self._page is not None
+            page = self._page
+            started = time.monotonic()
+            try:
+                await page.goto(list_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as exc:
+                self.traffic.record(
+                    "BROWSER",
+                    list_url,
+                    0,
+                    int((time.monotonic() - started) * 1000),
+                    f"open list fail {exc}",
+                )
+                return {"error": str(exc)[:200]}
+            await self._human_pause(0.8, 1.8)
+            await self._dismiss_overlays(page)
+            await self._human_browse_page(page, scrolls=2)
+            self.traffic.record(
+                "BROWSER",
+                list_url,
+                200,
+                int((time.monotonic() - started) * 1000),
+                "open search list",
+            )
+            if await self._looks_like_captcha(page):
+                return self._captcha_result(list_url, started)
+            if await self._looks_like_login(page):
+                return {"needs_login": True, "error": "login required"}
+            return {}
 
-        Result keys: phones, needs_login, needs_captcha, error, description
-        """
+    async def scroll_search_list(self) -> dict[str, Any]:
+        """Scroll the current search list to load more cards."""
+        async with self._get_lock():
+            await self.ensure()
+            assert self._page is not None
+            page = self._page
+            if await self._looks_like_captcha(page):
+                return self._captcha_result(page.url or "", time.monotonic())
+            await self._human_browse_page(page, scrolls=random.randint(2, 4))
+            await self._dismiss_overlays(page)
+            return {}
+
+    async def collect_list_ads(self) -> list[dict[str, str]]:
+        """Visible /v/ cards currently on the search page."""
+        async with self._get_lock():
+            await self.ensure()
+            assert self._page is not None
+            try:
+                rows = await self._page.evaluate(
+                    """() => {
+                      const seen = new Set();
+                      const out = [];
+                      for (const a of document.querySelectorAll('a[href*="/v/"]')) {
+                        const href = a.href || a.getAttribute('href') || '';
+                        const m = href.match(/\\/v\\/([^/?#]+)/);
+                        if (!m || seen.has(m[1])) continue;
+                        seen.add(m[1]);
+                        const title = (a.innerText || a.getAttribute('title') || '')
+                          .replace(/\\s+/g, ' ').trim().slice(0, 200);
+                        out.push({ token: m[1], title, href });
+                      }
+                      return out;
+                    }"""
+                )
+            except Exception:
+                return []
+            return [
+                {
+                    "token": str(row.get("token") or ""),
+                    "title": str(row.get("title") or ""),
+                    "href": str(row.get("href") or ""),
+                }
+                for row in (rows or [])
+                if row.get("token")
+            ]
+
+    async def open_ad_from_list(self, token: str, list_url: str) -> dict[str, Any]:
+        """Click a card from the list (fallback: direct /v/ URL), then reveal phone."""
+        async with self._get_lock():
+            await self.ensure()
+            assert self._page is not None
+            page = self._page
+            opened = await self._open_listing_from_list(token, list_url)
+            if opened.get("error") and not opened.get("needs_captcha") and not opened.get("needs_login"):
+                return {
+                    "phones": [],
+                    "needs_login": False,
+                    "needs_captcha": False,
+                    "error": opened["error"],
+                    "description": "",
+                }
+            if opened.get("needs_captcha"):
+                return {
+                    "phones": [],
+                    "needs_login": False,
+                    "needs_captcha": True,
+                    "error": "captcha",
+                    "vnc_url": opened.get("vnc_url"),
+                    "description": "",
+                }
+            if opened.get("needs_login"):
+                return {
+                    "phones": [],
+                    "needs_login": True,
+                    "needs_captcha": False,
+                    "error": "login required",
+                    "description": "",
+                }
+            result = await self._reveal_phone_on_current_page(token)
+            await self._return_to_list(list_url)
+            return result
+
+    async def reveal_phone(self, token: str) -> dict[str, Any]:
+        """Open listing page, browse a bit, click contact, return phones."""
         async with self._get_lock():
             opened = await self._open_listing(token)
             if opened.get("error") and not opened.get("needs_captcha") and not opened.get("needs_login"):
@@ -273,134 +389,137 @@ class BrowserSession:
                     "error": "login required",
                     "description": "",
                 }
+            return await self._reveal_phone_on_current_page(token)
 
-            page = self._page
-            assert page is not None
-            url = POST_URL.format(token=token)
-            fields = await self._scrape_listing_fields(page)
+    async def _reveal_phone_on_current_page(self, token: str) -> dict[str, Any]:
+        page = self._page
+        assert page is not None
+        url = POST_URL.format(token=token)
+        await self._human_browse_page(page, scrolls=random.randint(1, 3))
+        fields = await self._scrape_listing_fields(page)
 
-            try:
-                await page.wait_for_selector("button.post-actions__get-contact", timeout=12000)
-            except Exception:
-                pass
+        try:
+            await page.wait_for_selector("button.post-actions__get-contact", timeout=12000)
+        except Exception:
+            pass
+        await self._human_pause(0.4, 1.2)
 
-            click_started = time.monotonic()
-            response_body = ""
-            response_status = 0
-            clicked = False
-            try:
-                async with page.expect_response(
-                    lambda r: any(h in r.url for h in CONTACT_HINT),
-                    timeout=15000,
-                ) as pending:
-                    clicked = await self._click_contact(page)
-                    if not clicked:
-                        raise RuntimeError("contact button not found")
-                    response = await pending.value
-                    response_status = response.status
-                    response_body = await response.text()
-            except Exception as exc:
-                if await self._looks_like_captcha(page):
-                    return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
+        click_started = time.monotonic()
+        response_body = ""
+        response_status = 0
+        clicked = False
+        try:
+            async with page.expect_response(
+                lambda r: any(h in r.url for h in CONTACT_HINT),
+                timeout=15000,
+            ) as pending:
+                clicked = await self._click_contact(page)
                 if not clicked:
-                    clicked = await self._click_contact(page)
-                if not clicked:
-                    self.traffic.record(
-                        "BROWSER",
-                        url,
-                        404,
-                        int((time.monotonic() - click_started) * 1000),
-                        "contact button missing",
-                    )
-                    if await self._looks_like_captcha(page):
-                        return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
-                    if await self._looks_like_login(page):
-                        return {
-                            "phones": [],
-                            "needs_login": True,
-                            "needs_captcha": False,
-                            "error": "login required",
-                            "description": fields.get("description") or "",
-                        }
-                    return {
-                        "phones": [],
-                        "needs_login": False,
-                        "needs_captcha": False,
-                        "error": f"contact button not found ({exc})",
-                        "description": fields.get("description") or "",
-                    }
-                await page.wait_for_timeout(2000)
-                response_body = await self._safe_text(page)
-
+                    raise RuntimeError("contact button not found")
+                response = await pending.value
+                response_status = response.status
+                response_body = await response.text()
+        except Exception as exc:
             if await self._looks_like_captcha(page):
                 return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
-
-            if response_status == 401 or "LOGIN_REQUIRED" in (response_body or ""):
+            if not clicked:
+                clicked = await self._click_contact(page)
+            if not clicked:
                 self.traffic.record(
                     "BROWSER",
                     url,
-                    401,
+                    404,
                     int((time.monotonic() - click_started) * 1000),
-                    "reveal needs login",
+                    "contact button missing",
                 )
-                return {
-                    "phones": [],
-                    "needs_login": True,
-                    "needs_captcha": False,
-                    "error": "login required",
-                    "description": fields.get("description") or "",
-                }
-
-            if self._body_looks_like_captcha(response_body):
-                return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
-
-            phones = phones_from_contact(response_body) if response_body else []
-            if not phones:
-                await page.wait_for_timeout(1500)
                 if await self._looks_like_captcha(page):
                     return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
-                tels = await page.eval_on_selector_all(
-                    'a[href^="tel:"]',
-                    "els => els.map(e => e.getAttribute('href') || '')",
-                )
-                blob = " ".join(tels) + " " + await self._safe_text(page)
-                phones = canonical_phones(blob)
-                # Clicked contact but no number and a challenge modal is up.
-                if not phones and await self._looks_like_captcha(page):
-                    return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
-
-            if await self._looks_like_login(page) and not phones:
-                self.traffic.record(
-                    "BROWSER",
-                    url,
-                    401,
-                    int((time.monotonic() - click_started) * 1000),
-                    "reveal needs login",
-                )
+                if await self._looks_like_login(page):
+                    return {
+                        "phones": [],
+                        "needs_login": True,
+                        "needs_captcha": False,
+                        "error": "login required",
+                        "description": fields.get("description") or "",
+                    }
                 return {
                     "phones": [],
-                    "needs_login": True,
+                    "needs_login": False,
                     "needs_captcha": False,
-                    "error": "login required",
+                    "error": f"contact button not found ({exc})",
                     "description": fields.get("description") or "",
                 }
+            await page.wait_for_timeout(2000)
+            response_body = await self._safe_text(page)
 
+        if await self._looks_like_captcha(page):
+            return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
+
+        if response_status == 401 or "LOGIN_REQUIRED" in (response_body or ""):
             self.traffic.record(
                 "BROWSER",
                 url,
-                response_status or (200 if phones else 204),
+                401,
                 int((time.monotonic() - click_started) * 1000),
-                f"reveal phone {token}: {len(phones)}",
+                "reveal needs login",
             )
             return {
-                "phones": phones,
-                "needs_login": False,
+                "phones": [],
+                "needs_login": True,
                 "needs_captcha": False,
-                "error": None if phones else "empty",
+                "error": "login required",
                 "description": fields.get("description") or "",
-                "subtitle": fields.get("subtitle") or "",
-                "specs": fields.get("specs") or {},
             }
+
+        if self._body_looks_like_captcha(response_body):
+            return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
+
+        phones = phones_from_contact(response_body) if response_body else []
+        if not phones:
+            await page.wait_for_timeout(1500)
+            if await self._looks_like_captcha(page):
+                return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
+            tels = await page.eval_on_selector_all(
+                'a[href^="tel:"]',
+                "els => els.map(e => e.getAttribute('href') || '')",
+            )
+            blob = " ".join(tels) + " " + await self._safe_text(page)
+            phones = canonical_phones(blob)
+            if not phones and await self._looks_like_captcha(page):
+                return {**self._captcha_result(url, click_started), "description": fields.get("description") or ""}
+
+        if await self._looks_like_login(page) and not phones:
+            self.traffic.record(
+                "BROWSER",
+                url,
+                401,
+                int((time.monotonic() - click_started) * 1000),
+                "reveal needs login",
+            )
+            return {
+                "phones": [],
+                "needs_login": True,
+                "needs_captcha": False,
+                "error": "login required",
+                "description": fields.get("description") or "",
+            }
+
+        self.traffic.record(
+            "BROWSER",
+            url,
+            response_status or (200 if phones else 204),
+            int((time.monotonic() - click_started) * 1000),
+            f"reveal phone {token}: {len(phones)}",
+        )
+        return {
+            "phones": phones,
+            "needs_login": False,
+            "needs_captcha": False,
+            "error": None if phones else "empty",
+            "description": fields.get("description") or "",
+            "subtitle": fields.get("subtitle") or "",
+            "specs": fields.get("specs") or {},
+        }
 
     async def _open_listing(self, token: str) -> dict[str, Any]:
         await self.ensure()
@@ -426,12 +545,107 @@ class BrowserSession:
             int((time.monotonic() - started) * 1000),
             f"open post {token}",
         )
+        await self._human_pause(0.6, 1.5)
         await self._dismiss_overlays(page)
         if await self._looks_like_captcha(page):
             return self._captcha_result(url, started)
         if await self._looks_like_login(page):
             return {"needs_login": True, "error": "login required"}
         return {}
+
+    async def _open_listing_from_list(self, token: str, list_url: str) -> dict[str, Any]:
+        page = self._page
+        assert page is not None
+        url = POST_URL.format(token=token)
+        started = time.monotonic()
+        clicked = False
+        try:
+            locator = page.locator(f'a[href*="/v/{token}"]').first
+            if await locator.count() > 0:
+                await locator.scroll_into_view_if_needed(timeout=3000)
+                await self._human_pause(0.3, 0.9)
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=45000):
+                    await locator.click(timeout=5000)
+                clicked = True
+        except Exception:
+            clicked = False
+        if not clicked:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as exc:
+                self.traffic.record(
+                    "BROWSER",
+                    url,
+                    0,
+                    int((time.monotonic() - started) * 1000),
+                    f"open from list fail {exc}",
+                )
+                return {"error": str(exc)[:200]}
+        self.traffic.record(
+            "BROWSER",
+            url,
+            200,
+            int((time.monotonic() - started) * 1000),
+            f"open post from list {token}",
+        )
+        await self._human_pause(0.7, 1.6)
+        await self._dismiss_overlays(page)
+        if await self._looks_like_captcha(page):
+            return self._captcha_result(url, started)
+        if await self._looks_like_login(page):
+            return {"needs_login": True, "error": "login required"}
+        return {}
+
+    async def _return_to_list(self, list_url: str) -> None:
+        page = self._page
+        if page is None:
+            return
+        await self._human_pause(0.5, 1.4)
+        try:
+            await page.go_back(wait_until="domcontentloaded", timeout=30000)
+            await self._human_pause(0.5, 1.2)
+            if "/s/" in (page.url or ""):
+                await self._dismiss_overlays(page)
+                return
+        except Exception:
+            pass
+        try:
+            await page.goto(list_url, wait_until="domcontentloaded", timeout=60000)
+            await self._human_pause(0.6, 1.4)
+            await self._dismiss_overlays(page)
+        except Exception:
+            pass
+
+    async def _human_pause(self, lo: float = 0.5, hi: float = 1.5) -> None:
+        page = self._page
+        ms = int(random.uniform(lo, hi) * 1000)
+        if page is None:
+            await asyncio.sleep(ms / 1000)
+            return
+        try:
+            await page.wait_for_timeout(ms)
+        except Exception:
+            await asyncio.sleep(ms / 1000)
+
+    async def _human_browse_page(self, page: Any, scrolls: int = 2) -> None:
+        """Scroll and pause so the visit looks less like a direct API hop."""
+        await self._human_pause(0.4, 1.0)
+        for _ in range(max(1, scrolls)):
+            delta = random.randint(350, 900)
+            try:
+                await page.mouse.wheel(0, delta)
+            except Exception:
+                try:
+                    await page.evaluate(f"window.scrollBy(0, {delta})")
+                except Exception:
+                    pass
+            await self._human_pause(0.35, 1.1)
+        if random.random() < 0.35:
+            try:
+                await page.mouse.wheel(0, -random.randint(120, 320))
+            except Exception:
+                pass
+            await self._human_pause(0.2, 0.6)
 
     async def _scrape_listing_fields(self, page: Any) -> dict[str, Any]:
         description = ""

@@ -220,16 +220,15 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 "fetch_details": body.fetch_details,
                 "fetch_phones": body.fetch_phones,
                 "loop": body.loop,
+                "source_url": resolved.get("source_url"),
             }
         )
         job["counts"] = db.job_counts(job["id"])
-        job["source_url"] = resolved.get("source_url")
         job["resolved_from"] = resolved.get("resolved_from")
         if body.start:
             manager.start(job["id"])
             job = db.get_job(job["id"]) or job
             job["counts"] = db.job_counts(job["id"])
-            job["source_url"] = resolved.get("source_url")
             job["resolved_from"] = resolved.get("resolved_from")
         return job
 
