@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     city_name TEXT NOT NULL,
     title_filter TEXT NOT NULL DEFAULT '[]',
     desc_filter TEXT NOT NULL DEFAULT '[]',
-    max_pages INTEGER NOT NULL DEFAULT 5,
+    max_pages INTEGER NOT NULL DEFAULT 0,
     fetch_details INTEGER NOT NULL DEFAULT 1,
     fetch_phones INTEGER NOT NULL DEFAULT 0,
     loop INTEGER NOT NULL DEFAULT 0,
@@ -334,6 +334,16 @@ class Database:
                 "SELECT * FROM listings WHERE id=?", (row["id"],)
             ).fetchone()
         return dict(claimed) if claimed else None
+
+    def processed_listing_tokens(self, job_id: int) -> set[str]:
+        """Tokens already finished for this job (skip on restart / account switch)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT token FROM listings
+                   WHERE job_id=? AND phone_status IN ('done', 'empty', 'skipped')""",
+                (job_id,),
+            ).fetchall()
+        return {str(row["token"]) for row in rows}
 
     def release_phone_claims(self, job_id: int | None = None) -> int:
         """Put interrupted 'working' rows back to pending."""

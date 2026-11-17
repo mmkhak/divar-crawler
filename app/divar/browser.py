@@ -264,7 +264,6 @@ class BrowserSession:
                 return {"error": str(exc)[:200]}
             await self._human_pause(0.8, 1.8)
             await self._dismiss_overlays(page)
-            await self._human_browse_page(page, scrolls=2)
             self.traffic.record(
                 "BROWSER",
                 list_url,
@@ -596,6 +595,21 @@ class BrowserSession:
             return {"needs_login": True, "error": "login required"}
         return {}
 
+    def _on_search_list_page(self, list_url: str) -> bool:
+        current = (self._page.url if self._page else "") or ""
+        if "/s/" not in current:
+            return False
+        try:
+            from urllib.parse import urlparse
+
+            want = urlparse(list_url)
+            got = urlparse(current)
+            if want.path and got.path and want.path.rstrip("/") == got.path.rstrip("/"):
+                return True
+        except Exception:
+            pass
+        return "/s/" in current
+
     async def _return_to_list(self, list_url: str) -> None:
         page = self._page
         if page is None:
@@ -604,7 +618,7 @@ class BrowserSession:
         try:
             await page.go_back(wait_until="domcontentloaded", timeout=30000)
             await self._human_pause(0.5, 1.2)
-            if "/s/" in (page.url or ""):
+            if self._on_search_list_page(list_url):
                 await self._dismiss_overlays(page)
                 return
         except Exception:

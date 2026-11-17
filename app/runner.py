@@ -29,6 +29,24 @@ from app.divar.urls import build_search_list_url
 from app.hub import EventHub
 from app.notify import notify_captcha
 
+HUMAN_EMPTY_SCROLL_LIMIT = 4
+
+
+def human_list_page_cap(max_pages: int | None) -> int | None:
+    """Optional cap on list scroll rounds; 0 or missing means unlimited."""
+    value = int(max_pages if max_pages is not None else 0)
+    if value <= 0:
+        return None
+    return value
+
+
+def fresh_list_ads(ads: list[dict[str, str]], seen: set[str]) -> list[dict[str, str]]:
+    return [ad for ad in ads if ad.get("token") and ad["token"] not in seen]
+
+
+def list_exhausted_after_refresh(empty_scrolls: int, list_refreshed: bool) -> bool:
+    return empty_scrolls >= HUMAN_EMPTY_SCROLL_LIMIT and list_refreshed
+
 
 class JobManager:
     def __init__(
@@ -141,8 +159,8 @@ class JobManager:
         await self._crawl_api_search(job_id)
 
     async def _crawl_human_browse(self, job_id: int) -> None:
-        """Open list URL in Chromium, scroll, open each ad, take contact, next."""
-        self._log(job_id, "شروع خزش انسانی (لیست → اسکرول → آگهی → تماس)")
+        """Open list URL in Chromium; collect visible cards, open each ad, reveal contact."""
+        self._log(job_id, "شروع خزش انسانی (لیست → جمع‌آوری → آگهی → تماس)")
         while True:
             job = self.db.get_job(job_id)
             if not job or job["status"] in {"stopped"}:
@@ -162,7 +180,13 @@ class JobManager:
             session = self.browsers.get(account.id)
             opened = await session.open_search_list(list_url)
             if opened.get("needs_captcha"):
-                await self._handle_account_captcha(job_id, account.id, session=session)
+                account = await self._resolve_captcha_or_switch(job_id, account.id, session=session)
+                if account is None:
+                    return
+                session = self.browsers.get(account.id)
+                opened = await session.open_search_list(list_url)
+            if opened.get("needs_captcha"):
+                await asyncio.sleep(2)
                 continue
             if opened.get("needs_login"):
                 self.db.update_browser_account(account.id, status="needs_login", last_error="login required")
@@ -174,16 +198,19 @@ class JobManager:
                 await asyncio.sleep(3)
                 continue
 
-            seen: set[str] = set()
+            seen: set[str] = set(self.db.processed_listing_tokens(job_id))
             empty_scrolls = 0
-            page_rounds = 0
-            max_pages = max(1, int(job.get("max_pages") or 5))
+            scroll_rounds = 0
+            page_cap = human_list_page_cap(job.get("max_pages"))
             switch_account = False
             list_finished = False
+            list_refreshed = False
             batch_size = max(1, int(float(self.db.setting("phone_batch_size") or 4)))
             batch_pause = max(0.0, float(self.db.setting("phone_batch_pause_sec") or 300))
             batch_count = 0
-            while page_rounds < max_pages:
+            fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
+
+            while not list_finished:
                 if not await self._wait_controls(job_id):
                     self.db.set_status(job_id, "stopped")
                     self._emit_job(job_id)
@@ -195,39 +222,16 @@ class JobManager:
                     switch_account = True
                     break
 
-                scrolled = await session.scroll_search_list()
-                if scrolled.get("needs_captcha"):
-                    await self._handle_account_captcha(job_id, account.id, session=session)
-                    await session.open_search_list(list_url)
-                    continue
-
-                ads = await session.collect_list_ads()
-                fresh_ads = [ad for ad in ads if ad["token"] not in seen]
-                if not fresh_ads:
-                    empty_scrolls += 1
-                    page_rounds += 1
-                    self.db.update_job(job_id, page=page_rounds)
-                    self._emit_job(job_id)
-                    if empty_scrolls >= 4:
-                        self._log(job_id, "آگهی تازه‌ای بعد از اسکرول پیدا نشد")
-                        list_finished = True
-                        break
-                    continue
-                empty_scrolls = 0
-                page_rounds += 1
-                self.db.update_job(job_id, page=page_rounds)
-                added = 0
-                for ad in fresh_ads:
-                    if not await self._wait_controls(job_id):
-                        self.db.set_status(job_id, "stopped")
-                        self._emit_job(job_id)
-                        return
-                    seen.add(ad["token"])
+                batch_added = 0
+                while fresh_queue:
+                    ad = fresh_queue.pop(0)
+                    token = ad["token"]
                     title = ad.get("title") or ""
                     if not matches_keywords(title, job.get("title_filter") or []):
+                        seen.add(token)
                         continue
                     record = {
-                        "token": ad["token"],
+                        "token": token,
                         "title": title,
                         "district": "",
                         "price_text": "",
@@ -235,40 +239,47 @@ class JobManager:
                         "description": None,
                         "phone": None,
                         "phone_status": "pending",
-                        "link": ad.get("href") or f"https://divar.ir/v/{ad['token']}",
+                        "link": ad.get("href") or f"https://divar.ir/v/{token}",
                         "red_text": "",
                         "found_by": "browser-list",
                     }
                     saved, created = self.db.upsert_listing(job_id, record)
                     if created:
-                        added += 1
+                        batch_added += 1
                         self.hub.publish("listing", _public_listing(saved, job["name"]))
                     elif saved.get("phone_status") in {"done", "empty", "skipped"}:
+                        seen.add(token)
                         continue
-                    else:
-                        saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
+                    saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
 
-                    # Inside a batch of N, keep gaps short; long rest happens after the batch.
                     result = await self._human_open_ad(
                         job_id,
                         saved,
                         account,
                         session,
                         list_url,
-                        pre_wait=jitter(1.0, 3.0),
                     )
                     if result == "stop":
                         self.db.set_status(job_id, "stopped")
                         self._emit_job(job_id)
                         return
+                    if result == "captcha":
+                        account = await self._resolve_captcha_or_switch(job_id, account.id, session=session)
+                        if account is None:
+                            return
+                        session = self.browsers.get(account.id)
+                        await session.open_search_list(list_url)
+                        fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
+                        break
                     if result == "switch_account":
                         switch_account = True
                         break
-                    if result == "reopen_list":
-                        await session.open_search_list(list_url)
-                        continue
-                    if result in {"ok", "error"}:
+                    if result == "ok":
+                        seen.add(token)
                         batch_count += 1
+                    elif result == "error":
+                        batch_count += 1
+                    if result in {"ok", "error"}:
                         if batch_count >= batch_size and batch_pause > 0:
                             mins = batch_pause / 60
                             self._log(
@@ -281,15 +292,63 @@ class JobManager:
                                 return
                             batch_count = 0
                             await session.open_search_list(list_url)
+                            fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
+                            break
                 if switch_account:
                     break
+
+                cap_label = str(page_cap) if page_cap is not None else "∞"
                 self._log(
                     job_id,
-                    f"اسکرول {page_rounds}/{max_pages} · تازه در لیست {added} · کل دیده {len(seen)}",
+                    f"اسکرول {scroll_rounds}/{cap_label} · تازه در دسته {batch_added} · کل دیده {len(seen)}",
                 )
                 self._emit_job(job_id)
-            else:
-                list_finished = True
+
+                if page_cap is not None and scroll_rounds >= page_cap:
+                    list_finished = True
+                    break
+
+                scrolled = await session.scroll_search_list()
+                if scrolled.get("needs_captcha"):
+                    account = await self._resolve_captcha_or_switch(job_id, account.id, session=session)
+                    if account is None:
+                        return
+                    session = self.browsers.get(account.id)
+                    await session.open_search_list(list_url)
+                    empty_scrolls = 0
+                    list_refreshed = False
+                    fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
+                    continue
+
+                scroll_rounds += 1
+                self.db.update_job(job_id, page=scroll_rounds)
+
+                ads = await session.collect_list_ads()
+                fresh_queue = fresh_list_ads(ads, seen)
+                if fresh_queue:
+                    empty_scrolls = 0
+                    continue
+
+                empty_scrolls += 1
+                if empty_scrolls >= HUMAN_EMPTY_SCROLL_LIMIT:
+                    if not list_refreshed:
+                        self._log(job_id, "اسکرول خالی؛ رفرش لیست")
+                        opened = await session.open_search_list(list_url)
+                        if opened.get("needs_captcha"):
+                            account = await self._resolve_captcha_or_switch(
+                                job_id, account.id, session=session
+                            )
+                            if account is None:
+                                return
+                            session = self.browsers.get(account.id)
+                            opened = await session.open_search_list(list_url)
+                        list_refreshed = True
+                        empty_scrolls = 0
+                        fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
+                        if fresh_queue:
+                            continue
+                    list_finished = True
+                    break
 
             if switch_account:
                 await asyncio.sleep(1)
@@ -380,9 +439,8 @@ class JobManager:
             self.db.update_listing(listing["id"], phone_status="pending")
             return "error"
         if outcome.get("needs_captcha"):
-            await self._handle_account_captcha(job_id, account.id, session=session)
             self.db.update_listing(listing["id"], phone_status="pending")
-            return "reopen_list"
+            return "captcha"
         if outcome.get("needs_login"):
             self.db.update_browser_account(account.id, status="needs_login", last_error="login required")
             self.hub.publish("browser_account", self.db.get_browser_account(account.id))
@@ -466,7 +524,8 @@ class JobManager:
                     self._emit_job(job_id)
                 return
             query = queries[index]
-            if job["query_done"] or job["page"] >= job["max_pages"]:
+            max_pages = int(job.get("max_pages") or 0)
+            if job["query_done"] or (max_pages > 0 and job["page"] >= max_pages):
                 self.db.update_job(job_id, query_index=index + 1, page=0, pagination=None, query_done=0)
                 continue
             label = query or "کل دسته"
@@ -521,7 +580,7 @@ class JobManager:
                 if _needs_detail(saved, job):
                     await self._fetch_detail(job_id, saved, job)
             new_page = job["page"] + 1
-            finished_query = (not has_next) or new_page >= job["max_pages"]
+            finished_query = (not has_next) or (max_pages > 0 and new_page >= max_pages)
             self.db.update_job(
                 job_id,
                 page=new_page,
@@ -605,14 +664,9 @@ class JobManager:
             if available(view, today)
         ]
 
-    async def _handle_account_captcha(
-        self,
-        job_id: int,
-        account_id: int,
-        session: Any = None,
-    ) -> None:
+    async def _mark_account_captcha(self, job_id: int, account_id: int) -> str:
         row = self.db.get_browser_account(account_id) or {}
-        label = row.get("phone") or row.get("label") or f"#{account_id}"
+        label = str(row.get("phone") or row.get("label") or f"#{account_id}")
         self.db.update_browser_account(
             account_id, status="captcha", last_error="needs captcha on contact"
         )
@@ -624,11 +678,6 @@ class JobManager:
             phone=row.get("phone"),
         )
         self.hub.publish("captcha", status)
-        self._log(
-            job_id,
-            f"کپچا روی اکانت {label} — VNC را باز کن، کپچا را حل کن، بعد در پنل «کپچا حل شد» را بزن",
-            "error",
-        )
         try:
             await notify_captcha(
                 account_label=str(row.get("label") or label),
@@ -638,7 +687,28 @@ class JobManager:
             )
         except Exception as exc:
             self._log(job_id, f"ارسال تلگرام برای کپچا ناموفق: {exc}", "warn")
-        # Keep this Chromium (with captcha) and hide the others on the shared VNC desktop.
+        return label
+
+    async def _resolve_captcha_or_switch(
+        self,
+        job_id: int,
+        account_id: int,
+        session: Any = None,
+    ) -> AccountView | None:
+        label = await self._mark_account_captcha(job_id, account_id)
+        other = self._pick_browser_account_excluding(account_id)
+        if other is not None:
+            self._log(
+                job_id,
+                f"کپچا روی اکانت {label}؛ ادامه با اکانت دیگر",
+                "warn",
+            )
+            return other
+        self._log(
+            job_id,
+            f"کپچا روی اکانت {label} — VNC را باز کن، کپچا را حل کن، بعد در پنل «کپچا حل شد» را بزن",
+            "error",
+        )
         try:
             await self.browsers.focus(account_id)
         except Exception as exc:
@@ -649,6 +719,24 @@ class JobManager:
         self.hub.publish("browser_account", self.db.get_browser_account(account_id))
         self.hub.publish("captcha", self.browsers.captcha_status())
         self._log(job_id, f"کپچا اکانت {label} رفع شد؛ ادامه")
+        row = self.db.get_browser_account(account_id)
+        return account_view_from_row(row) if row else None
+
+    async def _handle_account_captcha(
+        self,
+        job_id: int,
+        account_id: int,
+        session: Any = None,
+    ) -> None:
+        await self._resolve_captcha_or_switch(job_id, account_id, session=session)
+
+    def _pick_browser_account_excluding(self, exclude_id: int) -> AccountView | None:
+        accounts = [a for a in self._active_browser_accounts() if a.id != int(exclude_id)]
+        if not accounts:
+            return None
+        index = self._account_cursor % len(accounts)
+        self._account_cursor = (index + 1) % len(accounts)
+        return accounts[index]
 
     def _pick_browser_account(self) -> AccountView | None:
         accounts = self._active_browser_accounts()

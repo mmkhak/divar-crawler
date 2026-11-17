@@ -205,7 +205,7 @@ $("#url-job-form").addEventListener("submit", async (event) => {
       body: JSON.stringify({
         url: form.get("url"),
         name: form.get("name"),
-        max_pages: Number(form.get("max_pages") || 5),
+        max_pages: Number(form.get("max_pages") || 0),
         fetch_phones: form.get("fetch_phones") === "on",
         fetch_details: form.get("fetch_details") === "on",
         loop: form.get("loop") === "on",
@@ -230,7 +230,7 @@ $("#job-form").addEventListener("submit", async (event) => {
     city_id: form.get("city_id"),
     title_filter: [form.get("title_filter")].filter(Boolean),
     desc_filter: [form.get("desc_filter")].filter(Boolean),
-    max_pages: Number(form.get("max_pages") || 2),
+    max_pages: Number(form.get("max_pages") || 0),
     fetch_phones: form.get("fetch_phones") === "on",
     fetch_details: form.get("fetch_details") === "on",
     loop: form.get("loop") === "on",
