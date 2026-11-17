@@ -128,6 +128,11 @@ function renderBrowserAccounts(list) {
           ${account.phone ? `<span dir="ltr">${escapeHtml(account.phone)}</span> · ` : "شماره هنوز خوانده نشده · "}
           امروز ${account.views_today} از ${account.daily_cap}
           · تأخیر ${account.delay_min}–${account.delay_max} ثانیه
+          · گروه خروجی: ${escapeHtml(account.egress_label || account.egress_group || "direct")}
+          ${typeof account.egress_views_today === "number" ? ` · گروه امروز ${account.egress_views_today}/${account.egress_daily_cap || 50}` : ""}
+          ${account.egress_cooldown_until ? ` · مکث گروه تا ${escapeHtml((account.egress_cooldown_until || "").slice(11, 16))}` : ""}
+          ${account.fingerprint ? ` · اثرانگشت ${escapeHtml(account.fingerprint.profile_name || "")}` : ""}
+          ${account.proxy_configured ? ` · پروکسی <span dir="ltr">${escapeHtml(account.proxy_url_masked || "تنظیم‌شده")}</span>` : " · بدون پروکسی"}
           ${account.last_error ? "· " + escapeHtml(account.last_error) : ""}
         </div>
         <div class="row account-edit">
@@ -140,11 +145,16 @@ function renderBrowserAccounts(list) {
           <label>تا
             <input type="number" min="20" step="1" data-delay-max-input="${account.id}" value="${Number(account.delay_max) || 45}" dir="ltr" />
           </label>
-          <button type="button" data-save="${account.id}">ذخیره سقف</button>
+          <label>پروکسی
+            <input type="text" dir="ltr" data-proxy-input="${account.id}" value="${escapeHtml(account.proxy_url_masked || "")}" placeholder="http://user:pass@host:port" />
+          </label>
+          <button type="button" data-save="${account.id}">ذخیره</button>
         </div>
       </div>
       <div class="row">
         ${vncBtn}
+        <button type="button" data-test-proxy="${account.id}">تست پروکسی</button>
+        <button type="button" data-regen-fp="${account.id}">بازتولید اثرانگشت</button>
         ${account.status === "captcha" ? `<button type="button" data-focus="${account.id}">نمایش کپچا</button>` : ""}
         <button type="button" data-login="${account.id}">لاگین این اکانت</button>
         <button type="button" data-verify="${account.id}">تأیید اتصال</button>
@@ -276,6 +286,7 @@ $("#browser-account-form").addEventListener("submit", async (event) => {
         daily_cap: Number(form.get("daily_cap")),
         delay_min: Number(form.get("delay_min")),
         delay_max: Number(form.get("delay_max")),
+        proxy_url: (form.get("proxy_url") || "").trim() || null,
       }),
     });
     event.target.reset();
@@ -296,6 +307,7 @@ $("#browser-account-list").addEventListener("click", async (event) => {
       const cap = Number(document.querySelector(`[data-cap-input="${id}"]`)?.value);
       const delayMin = Number(document.querySelector(`[data-delay-min-input="${id}"]`)?.value);
       const delayMax = Number(document.querySelector(`[data-delay-max-input="${id}"]`)?.value);
+      const proxyUrl = String(document.querySelector(`[data-proxy-input="${id}"]`)?.value || "").trim();
       msg.textContent = "در حال ذخیره…";
       try {
         const updated = await api(`/api/browser-accounts/${id}`, {
@@ -305,13 +317,31 @@ $("#browser-account-list").addEventListener("click", async (event) => {
             daily_cap: cap,
             delay_min: delayMin,
             delay_max: delayMax,
+            proxy_url: proxyUrl || null,
           }),
         });
-        msg.textContent = `سقف اکانت ذخیره شد: ${updated.daily_cap} در روز`;
+        msg.textContent = `تنظیمات اکانت ذخیره شد`;
         renderBrowserAccounts(await api("/api/browser-accounts"));
       } catch (err) {
         msg.textContent = err.message;
       }
+      return;
+    }
+    if (btn.dataset.testProxy) {
+      msg.textContent = "در حال تست پروکسی…";
+      const result = await api(`/api/browser-accounts/${btn.dataset.testProxy}/test-proxy`, { method: "POST" });
+      if (result.ok) {
+        msg.textContent = `IP خروجی: ${result.ip || "؟"} · ${result.proxy_url_masked || "مستقیم"}`;
+      } else {
+        msg.textContent = result.error || "تست پروکسی ناموفق";
+      }
+      return;
+    }
+    if (btn.dataset.regenFp) {
+      msg.textContent = "بازتولید اثرانگشت…";
+      await api(`/api/browser-accounts/${btn.dataset.regenFp}/regenerate-fingerprint`, { method: "POST" });
+      msg.textContent = "اثرانگشت مرورگر برای این اکانت عوض شد؛ برای اثر کامل یک بار لاگین را با VNC تکرار کن.";
+      renderBrowserAccounts(await api("/api/browser-accounts"));
       return;
     }
     if (btn.dataset.focus) {

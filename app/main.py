@@ -20,13 +20,19 @@ from app.divar.traffic import TrafficBuffer
 from app.divar.urls import resolve_divar_search_url
 from app.exporting import listing_row, to_csv, to_xlsx
 from app.hub import EventHub
+from app.fingerprint import ensure_fingerprint_json
+from app.proxy_test import fetch_egress_ip
+from app.proxy_util import normalize_proxy_input
 from app.rate_policy import (
     MAX_DAILY_CAP,
+    MAX_EGRESS_DAILY_CAP,
     MAX_REVEALS_PER_10_MIN,
     MAX_REVEALS_PER_HOUR,
     MIN_PHONE_DELAY_SEC,
     clamp_captcha_cooldown_sec,
     clamp_daily_cap,
+    clamp_egress_captcha_cooldown_sec,
+    clamp_egress_daily_cap,
     clamp_phone_delays,
     clamp_setting_int,
     parse_iso,
@@ -74,6 +80,8 @@ class SettingsIn(BaseModel):
     reveals_per_10_min: int = 5
     reveals_per_hour: int = 20
     captcha_cooldown_sec: float = 2700
+    egress_daily_cap: int = 50
+    egress_captcha_cooldown_sec: float = 5400
 
 
 class CodeRequest(BaseModel):
@@ -95,6 +103,7 @@ class BrowserAccountIn(BaseModel):
     daily_cap: int = 80
     delay_min: float = 25
     delay_max: float = 45
+    proxy_url: str | None = None
 
 
 class BrowserAccountUpdate(BaseModel):
@@ -102,6 +111,7 @@ class BrowserAccountUpdate(BaseModel):
     daily_cap: int | None = None
     delay_min: float | None = None
     delay_max: float | None = None
+    proxy_url: str | None = None
 
 
 def _split_words(values: list[str]) -> list[str]:
@@ -122,6 +132,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     traffic = TrafficBuffer()
     traffic.on_entry(lambda entry: hub.publish("traffic", entry))
     browsers = BrowserPool(data / "chrome-profiles", traffic)
+    browsers.set_account_loader(lambda account_id: db.get_browser_account(int(account_id), internal=True))
     manager = JobManager(db, hub, data, traffic=traffic, browsers=browsers)
     auth_client = DivarClient(traffic=traffic)
     app = FastAPI(title="پنل دیوار")
@@ -184,6 +195,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         )
         reveals_1h = clamp_setting_int(body.reveals_per_hour, default=20, upper=MAX_REVEALS_PER_HOUR)
         captcha_cd = clamp_captcha_cooldown_sec(body.captcha_cooldown_sec)
+        egress_cap = clamp_egress_daily_cap(body.egress_daily_cap)
+        if body.egress_daily_cap > MAX_EGRESS_DAILY_CAP:
+            raise HTTPException(400, f"سقف روزانه هر گروه خروجی حداکثر {MAX_EGRESS_DAILY_CAP} است")
+        egress_cd = clamp_egress_captcha_cooldown_sec(body.egress_captcha_cooldown_sec)
         saved = db.update_settings(
             {
                 "anon_rps": str(body.anon_rps),
@@ -195,6 +210,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 "reveals_per_10_min": str(reveals_10m),
                 "reveals_per_hour": str(reveals_1h),
                 "captcha_cooldown_sec": str(int(captcha_cd)),
+                "egress_daily_cap": str(egress_cap),
+                "egress_captcha_cooldown_sec": str(int(egress_cd)),
             }
         )
         manager.refresh_rate()
@@ -393,11 +410,18 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     @app.get("/api/reveal-events")
     async def reveal_events(
         account_id: int | None = None,
+        egress_group: str | None = None,
         kind: str | None = None,
         limit: int = Query(200, le=2000),
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        return db.list_reveal_events(account_id=account_id, kind=kind, limit=limit, offset=offset)
+        return db.list_reveal_events(
+            account_id=account_id,
+            egress_group=egress_group,
+            kind=kind,
+            limit=limit,
+            offset=offset,
+        )
 
     @app.post("/api/browser-accounts/{account_id}/focus")
     async def focus_browser_account(account_id: int) -> dict[str, Any]:
@@ -435,6 +459,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 "daily_cap": cap,
                 "delay_min": lo,
                 "delay_max": hi,
+                "proxy_url": normalize_proxy_input(body.proxy_url),
             }
         )
         hub.publish("browser_account", account)
@@ -474,6 +499,13 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                     f"حداقل فاصله بین هر شماره حداقل {int(MIN_PHONE_DELAY_SEC)} ثانیه است",
                 )
             fields["delay_max"] = float(body.delay_max)
+        if body.proxy_url is not None:
+            incoming = (body.proxy_url or "").strip()
+            masked_current = str(account.get("proxy_url_masked") or "")
+            if incoming and ":***@" in incoming and incoming == masked_current:
+                pass
+            else:
+                fields["proxy_url"] = normalize_proxy_input(body.proxy_url)
         if not fields:
             return account
         if "delay_min" in fields or "delay_max" in fields:
@@ -548,6 +580,28 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         )
         hub.publish("browser_account", updated)
         return {"ok": True, "logged_in": True, "account": updated}
+
+    @app.post("/api/browser-accounts/{account_id}/test-proxy")
+    async def test_browser_account_proxy(account_id: int) -> dict[str, Any]:
+        account = db.get_browser_account(account_id, internal=True)
+        if not account:
+            raise HTTPException(404, "اکانت پیدا نشد")
+        result = await fetch_egress_ip(account.get("proxy_url"))
+        from app.proxy_util import egress_group
+
+        result["egress_group"] = egress_group(account.get("proxy_url"))
+        return result
+
+    @app.post("/api/browser-accounts/{account_id}/regenerate-fingerprint")
+    async def regenerate_browser_fingerprint(account_id: int) -> dict[str, Any]:
+        account = db.get_browser_account(account_id, internal=True)
+        if not account:
+            raise HTTPException(404, "اکانت پیدا نشد")
+        fp_json = ensure_fingerprint_json(account_id, None, regenerate=True)
+        updated = db.update_browser_account(account_id, fingerprint_json=fp_json)
+        await browsers.close(account_id)
+        hub.publish("browser_account", updated)
+        return {"ok": True, "account": updated}
 
     @app.delete("/api/browser-accounts/{account_id}")
     async def delete_browser_account(account_id: int) -> dict[str, bool]:

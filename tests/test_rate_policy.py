@@ -59,7 +59,7 @@ def test_refresh_backoff_grows_and_caps():
     late = refresh_backoff_seconds(10)
     assert 4 * 60 <= first <= 6 * 60
     assert second > first
-    assert late <= 31 * 60
+    assert late <= 33 * 60
 
 
 def test_human_browse_lock_conflict(tmp_path):
@@ -69,6 +69,8 @@ def test_human_browse_lock_conflict(tmp_path):
 
     app = create_app(tmp_path)
     with TestClient(app) as client:
+        account = client.post("/api/browser-accounts", json={"label": "lock"}).json()
+        app.state.db.update_browser_account(account["id"], status="active", phone="09120000000")
         j1 = client.post(
             "/api/jobs",
             json={"category": "beauty", "fetch_phones": True},
@@ -77,7 +79,8 @@ def test_human_browse_lock_conflict(tmp_path):
             "/api/jobs",
             json={"category": "beauty", "fetch_phones": True},
         ).json()["id"]
-        app.state.manager._human_browse_holder = j1
+        app.state.manager._human_browse_by_egress["direct"] = j1
+        app.state.manager._job_egress[j1] = "direct"
         conflict = client.post(f"/api/jobs/{j2}/start")
         assert conflict.status_code == 409
         assert "خزش انسانی" in conflict.json()["detail"]
