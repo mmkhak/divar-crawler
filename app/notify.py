@@ -9,13 +9,26 @@ import httpx
 log = logging.getLogger(__name__)
 
 
+def _env(name: str) -> str:
+    value = (os.environ.get(name) or "").strip().strip("'\"")
+    return value
+
+
 def telegram_configured() -> bool:
-    return bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
+    return bool(_env("TELEGRAM_BOT_TOKEN") and _env("TELEGRAM_CHAT_ID"))
+
+
+def _bot_token() -> str:
+    token = _env("TELEGRAM_BOT_TOKEN")
+    # people sometimes paste "bot123:ABC" from docs
+    if token.lower().startswith("bot"):
+        token = token[3:]
+    return token
 
 
 async def send_telegram(text: str) -> bool:
-    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-    chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    token = _bot_token()
+    chat_id = _env("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -24,7 +37,7 @@ async def send_telegram(text: str) -> bool:
         "text": text,
         "disable_web_page_preview": True,
     }
-    proxy = (os.environ.get("TELEGRAM_PROXY") or "").strip() or None
+    proxy = _env("TELEGRAM_PROXY") or None
     try:
         kwargs: dict = {"timeout": 15.0, "trust_env": False}
         if proxy:
@@ -32,7 +45,15 @@ async def send_telegram(text: str) -> bool:
         async with httpx.AsyncClient(**kwargs) as client:
             response = await client.post(url, json=payload)
         if response.status_code >= 400:
-            log.warning("telegram notify failed: %s %s", response.status_code, response.text[:200])
+            hint = ""
+            if response.status_code == 401:
+                hint = f" (bad TELEGRAM_BOT_TOKEN; len={len(token)} prefix={token.split(':', 1)[0]!r})"
+            log.warning(
+                "telegram notify failed: %s %s%s",
+                response.status_code,
+                response.text[:200],
+                hint,
+            )
             return False
         return True
     except Exception as exc:
