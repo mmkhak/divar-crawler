@@ -67,9 +67,19 @@ CAPTCHA_MARKERS = (
 
 
 class BrowserSession:
-    def __init__(self, profile_dir: Path, traffic: TrafficBuffer | None = None) -> None:
+    def __init__(
+        self,
+        profile_dir: Path,
+        traffic: TrafficBuffer | None = None,
+        *,
+        proxy: dict[str, str] | None = None,
+        fingerprint: dict[str, Any] | None = None,
+    ) -> None:
         self.profile_dir = Path(profile_dir)
         self.traffic = traffic or TrafficBuffer()
+        self._proxy = proxy
+        self._fingerprint = fingerprint
+        self._launch_key = self._config_key(proxy, fingerprint)
         self._playwright = None
         self._context = None
         self._page = None
@@ -77,6 +87,31 @@ class BrowserSession:
         self.captcha_active = False
         self._captcha_gate = None
         self.vnc_url = os.environ.get("VNC_URL", DEFAULT_VNC_URL).strip() or DEFAULT_VNC_URL
+
+    @staticmethod
+    def _config_key(proxy: dict[str, str] | None, fingerprint: dict[str, Any] | None) -> str:
+        import json
+
+        return json.dumps(
+            {"proxy": proxy or {}, "fp": (fingerprint or {}).get("user_agent", "")},
+            sort_keys=True,
+        )
+
+    def update_launch_config(
+        self,
+        *,
+        proxy: dict[str, str] | None,
+        fingerprint: dict[str, Any] | None,
+    ) -> bool:
+        key = self._config_key(proxy, fingerprint)
+        if key == self._launch_key and self._page is not None:
+            self._proxy = proxy
+            self._fingerprint = fingerprint
+            return False
+        self._proxy = proxy
+        self._fingerprint = fingerprint
+        self._launch_key = key
+        return True
 
     def _get_lock(self):
         import asyncio
@@ -114,6 +149,10 @@ class BrowserSession:
             return
         from playwright.async_api import async_playwright
 
+        from app.fingerprint import fingerprint_from_row, platform_init_script, playwright_context_options
+
+        fp = self._fingerprint or fingerprint_from_row({"id": 0, "fingerprint_json": None})
+        ctx_opts = playwright_context_options(fp)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         clear_profile_locks(self.profile_dir)
         headless = _env_bool("BROWSER_HEADLESS", False)
@@ -122,13 +161,23 @@ class BrowserSession:
             try:
                 if self._playwright is None:
                     self._playwright = await async_playwright().start()
-                self._context = await self._playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(self.profile_dir),
-                    headless=headless,
-                    viewport={"width": 1365, "height": 900},
-                    locale="fa-IR",
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
+                launch_kwargs: dict[str, Any] = {
+                    "user_data_dir": str(self.profile_dir),
+                    "headless": headless,
+                    "locale": ctx_opts.get("locale") or "fa-IR",
+                    "args": ["--disable-blink-features=AutomationControlled"],
+                    "viewport": ctx_opts.get("viewport") or {"width": 1365, "height": 900},
+                    "user_agent": ctx_opts.get("user_agent"),
+                    "device_scale_factor": ctx_opts.get("device_scale_factor"),
+                    "timezone_id": ctx_opts.get("timezone_id"),
+                    "is_mobile": ctx_opts.get("is_mobile"),
+                    "extra_http_headers": ctx_opts.get("extra_http_headers"),
+                }
+                if self._proxy:
+                    launch_kwargs["proxy"] = dict(self._proxy)
+                self._context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
+                if fp.get("platform"):
+                    await self._context.add_init_script(platform_init_script(str(fp.get("platform"))))
                 self._page = (
                     self._context.pages[0]
                     if self._context.pages
@@ -825,17 +874,42 @@ class BrowserPool:
         self._captcha_account_id: int | None = None
         self._captcha_label: str | None = None
         self._captcha_phone: str | None = None
+        self._account_loader: Any = None
         self.vnc_url = os.environ.get("VNC_URL", DEFAULT_VNC_URL).strip() or DEFAULT_VNC_URL
+
+    def set_account_loader(self, loader: Any) -> None:
+        self._account_loader = loader
+
+    def _launch_config(self, account_id: int) -> tuple[dict[str, str] | None, dict[str, Any]]:
+        from app.fingerprint import fingerprint_from_row
+        from app.proxy_util import playwright_proxy
+
+        row = self._account_loader(account_id) if self._account_loader else {}
+        proxy = playwright_proxy(row.get("proxy_url") if row else None)
+        fp = fingerprint_from_row(row or {"id": account_id, "fingerprint_json": None})
+        return proxy, fp
 
     def profile_dir(self, account_id: int) -> Path:
         return self.root / str(account_id)
 
     def get(self, account_id: int) -> BrowserSession:
         account_id = int(account_id)
+        proxy, fp = self._launch_config(account_id)
         session = self._sessions.get(account_id)
         if session is None:
-            session = BrowserSession(self.profile_dir(account_id), self.traffic)
+            session = BrowserSession(self.profile_dir(account_id), self.traffic, proxy=proxy, fingerprint=fp)
             self._sessions[account_id] = session
+            return session
+        if session.update_launch_config(proxy=proxy, fingerprint=fp) and session._page is not None:
+            # Proxy or fingerprint changed — recreate context on next ensure().
+            import asyncio
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(session.close())
+            except RuntimeError:
+                pass
+            session._page = None
         return session
 
     async def focus(self, account_id: int) -> BrowserSession:

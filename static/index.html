@@ -128,6 +128,8 @@
         <label>تأخیر از <input name="delay_min" type="number" value="25" min="20" /></label>
         <label>تا <input name="delay_max" type="number" value="45" min="20" /></label>
       </div>
+      <label>پروکسی (اختیاری) <input name="proxy_url" placeholder="http://user:pass@host:port یا socks5://…" dir="ltr" style="width:100%" /></label>
+      <p class="muted">هر اکانت می‌تواند پروکسی جدا داشته باشد (http/https/socks5). رمز پروکسی در API و لاگ‌ها نمایش داده نمی‌شود. چند اکانت بدون پروکسی جدا، روی <strong>یک IP سرور</strong> همان گروه خروجی را دارند.</p>
       <p class="muted">حداقل تأخیر بین هر شماره در برنامه ۲۰ ثانیه است؛ مقادیر کمتر خودکار بالا برده می‌شوند.</p>
       <button type="submit">افزودن اکانت</button>
       <p id="browser-account-msg" class="muted"></p>
@@ -154,6 +156,11 @@
         <label>سقف شماره در ساعت <input name="reveals_per_hour" type="number" value="20" min="1" max="40" /></label>
         <label>کول‌داون بعد کپچا (ثانیه) <input name="captcha_cooldown_sec" type="number" value="2700" min="1800" max="3600" /></label>
       </div>
+      <div class="row">
+        <label>سقف روزانه هر گروه خروجی (IP/پروکسی) <input name="egress_daily_cap" type="number" value="50" min="1" max="150" /></label>
+        <label>مکث گروه بعد کپچا (ثانیه) <input name="egress_captcha_cooldown_sec" type="number" value="5400" min="1800" max="21600" /></label>
+      </div>
+      <p class="muted">بعد از کپچا، کل گروه خروجی (همه اکانت‌های همان پروکسی یا IP مستقیم) موقتاً متوقف می‌شود؛ تعویض به اکانت دیگر در همان گروه مجاز نیست.</p>
       <button type="submit">ذخیره</button>
       <button type="button" id="refresh-cities">به‌روزرسانی فهرست شهرها</button>
       <p id="settings-msg" class="muted"></p>

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ from app.divar.traffic import TrafficBuffer
 from app.divar.urls import build_search_list_url
 from app.hub import EventHub
 from app.notify import notify_captcha
+from app.proxy_util import egress_group as egress_group_key
+from app.proxy_util import scrub_secrets
 from app.rate_policy import (
     DEFAULT_REVEALS_PER_10_MIN,
     DEFAULT_REVEALS_PER_HOUR,
@@ -35,7 +38,10 @@ from app.rate_policy import (
     apply_captcha_penalty_fields,
     batch_pause_seconds,
     clamp_captcha_cooldown_sec,
+    clamp_egress_captcha_cooldown_sec,
+    clamp_egress_daily_cap,
     clamp_setting_int,
+    egress_rate_blocked,
     parse_iso,
     phone_reveal_wait,
     refresh_backoff_seconds,
@@ -87,14 +93,84 @@ class JobManager:
         self._pause: dict[int, asyncio.Event] = {}
         self._stop: dict[int, asyncio.Event] = {}
         self._account_cursor = 0
-        self._human_browse_holder: int | None = None
+        self._human_browse_by_egress: dict[str, int] = {}
+        self._job_egress: dict[int, str] = {}
+        self._batch_count_by_egress: dict[str, int] = {}
 
     def human_browse_active_job(self) -> int | None:
-        return self._human_browse_holder
+        if not self._human_browse_by_egress:
+            return None
+        return next(iter(self._human_browse_by_egress.values()))
+
+    def human_browse_by_egress(self) -> dict[str, int]:
+        return dict(self._human_browse_by_egress)
 
     def _release_human_browse(self, job_id: int) -> None:
-        if self._human_browse_holder == job_id:
-            self._human_browse_holder = None
+        egress = self._job_egress.pop(job_id, None)
+        if egress and self._human_browse_by_egress.get(egress) == job_id:
+            self._human_browse_by_egress.pop(egress, None)
+
+    def _claim_human_browse_egress(self, job_id: int, egress: str) -> None:
+        holder = self._human_browse_by_egress.get(egress)
+        if holder is not None and holder != job_id:
+            raise HumanBrowseConflictError(holder)
+        prev = self._job_egress.get(job_id)
+        if prev and prev != egress and self._human_browse_by_egress.get(prev) == job_id:
+            self._human_browse_by_egress.pop(prev, None)
+        self._human_browse_by_egress[egress] = job_id
+        self._job_egress[job_id] = egress
+
+    def _egress_for_account_id(self, account_id: int) -> str:
+        row = self.db.get_browser_account(int(account_id), internal=True) or {}
+        return egress_group_key(row.get("proxy_url"))
+
+    def _egress_daily_cap(self) -> int:
+        return clamp_egress_daily_cap(int(float(self.db.setting("egress_daily_cap") or 50)))
+
+    def _egress_reveal_counts(self, egress: str) -> tuple[int, int]:
+        return (
+            self.db.count_reveal_events_for_egress(egress, 600),
+            self.db.count_reveal_events_for_egress(egress, 3600),
+        )
+
+    def _egress_views_today(self, egress: str) -> int:
+        row = self.db.get_egress_group(egress) or {}
+        return int(row.get("views_today") or 0)
+
+    def _egress_blocked_reason(self, egress: str) -> str | None:
+        cap_10m, cap_1h = self._rate_caps()
+        row = self.db.get_egress_group(egress)
+        r10, r1h = self._egress_reveal_counts(egress)
+        return egress_rate_blocked(
+            row,
+            r10,
+            r1h,
+            cap_10m=cap_10m,
+            cap_1h=cap_1h,
+            views_today=self._egress_views_today(egress),
+            daily_cap=self._egress_daily_cap(),
+        )
+
+    def _egress_wait_seconds(self, egress: str, reason: str | None = None) -> float:
+        if reason in {"egress_rolling_10m", "rolling_10m"}:
+            window = 600
+            oldest = self.db.oldest_reveal_in_window_egress(egress, window)
+        elif reason in {"egress_rolling_1h", "rolling_1h"}:
+            window = 3600
+            oldest = self.db.oldest_reveal_in_window_egress(egress, window)
+        else:
+            row = self.db.get_egress_group(egress) or {}
+            until = parse_iso(row.get("captcha_cooldown_until"))
+            if until:
+                return max(0.0, (until - tehran_now()).total_seconds())
+            return 0.0
+        if not oldest:
+            return 5.0
+        start = parse_iso(oldest)
+        if not start:
+            return 5.0
+        elapsed = (tehran_now() - start).total_seconds()
+        return max(1.0, float(window) - elapsed)
 
     def _rate_caps(self) -> tuple[int, int]:
         settings = self.db.settings()
@@ -118,9 +194,9 @@ class JobManager:
         if not job:
             raise KeyError(job_id)
         if job.get("fetch_phones"):
-            holder = self._human_browse_holder
-            if holder is not None and holder != job_id:
-                raise HumanBrowseConflictError(holder)
+            starter = self._peek_browser_account()
+            if starter is not None:
+                self._claim_human_browse_egress(job_id, self._egress_for_account_id(starter.id))
         if job["status"] == "done":
             self.db.update_job(job_id, query_index=0, page=0, pagination=None, query_done=0, error=None)
         self.db.release_phone_claims(job_id)
@@ -132,8 +208,6 @@ class JobManager:
             self._emit_job(job_id)
             return
         self.db.set_status(job_id, "running", None)
-        if job.get("fetch_phones"):
-            self._human_browse_holder = job_id
         self._tasks[job_id] = asyncio.create_task(self._run(job_id))
         self._emit_job(job_id)
 
@@ -256,7 +330,9 @@ class JobManager:
             list_refreshed = False
             batch_size = max(1, int(float(self.db.setting("phone_batch_size") or 4)))
             batch_pause_base = max(0.0, float(self.db.setting("phone_batch_pause_sec") or 600))
-            batch_count = 0
+            egress = self._egress_for_account_id(account.id)
+            self._claim_human_browse_egress(job_id, egress)
+            batch_count = self._batch_count_by_egress.get(egress, 0)
             empty_refresh_streak = 0
             fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
 
@@ -310,6 +386,9 @@ class JobManager:
                         return
                     if ready.id != account.id:
                         account = ready
+                        egress = self._egress_for_account_id(account.id)
+                        self._claim_human_browse_egress(job_id, egress)
+                        batch_count = self._batch_count_by_egress.get(egress, 0)
                         session = self.browsers.get(account.id)
                         await session.open_search_list(list_url)
                         fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
@@ -327,7 +406,14 @@ class JobManager:
                     if result == "captcha":
                         account = await self._resolve_captcha_or_switch(job_id, account.id, session=session)
                         if account is None:
-                            return
+                            if not await self._wait_for_any_egress_account(job_id):
+                                return
+                            account = self._pick_browser_account()
+                            if account is None:
+                                return
+                        egress = self._egress_for_account_id(account.id)
+                        self._claim_human_browse_egress(job_id, egress)
+                        batch_count = self._batch_count_by_egress.get(egress, 0)
                         session = self.browsers.get(account.id)
                         await session.open_search_list(list_url)
                         fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
@@ -338,21 +424,24 @@ class JobManager:
                     if result == "ok":
                         seen.add(token)
                         batch_count += 1
+                        self._batch_count_by_egress[egress] = batch_count
                     elif result == "error":
                         batch_count += 1
+                        self._batch_count_by_egress[egress] = batch_count
                     if result in {"ok", "error"}:
                         if batch_count >= batch_size and batch_pause_base > 0:
                             batch_pause = batch_pause_seconds(batch_pause_base)
                             mins = batch_pause / 60
                             self._log(
                                 job_id,
-                                f"{batch_size} شماره پشت‌سرهم گرفته شد؛ {mins:.0f} دقیقه صبر",
+                                f"{batch_size} شماره پشت‌سرهم (گروه {egress})؛ {mins:.0f} دقیقه صبر",
                             )
                             if not await self._sleep_interruptible(job_id, batch_pause):
                                 self.db.set_status(job_id, "stopped")
                                 self._emit_job(job_id)
                                 return
                             batch_count = 0
+                            self._batch_count_by_egress[egress] = 0
                             await session.open_search_list(list_url)
                             fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
                             break
@@ -508,7 +597,7 @@ class JobManager:
         list_url: str,
         pre_wait: float | None = None,
     ) -> str:
-        row = self.db.get_browser_account(account.id) or {}
+        row = self.db.get_browser_account(account.id, internal=True) or {}
         if pre_wait is None:
             wait = phone_reveal_wait(row, self.db.settings())
         else:
@@ -561,11 +650,13 @@ class JobManager:
         updated = self.db.update_listing(listing["id"], **updates)
         self.db.bump_browser_account_view(account.id)
         if phone_status in {"done", "empty"}:
+            eg = egress_group_key(row.get("proxy_url"))
             self.db.record_reveal_event(
                 account.id,
                 kind="reveal",
                 job_id=job_id,
                 token=str(listing.get("token") or ""),
+                egress_group_key=eg,
             )
         self.hub.publish("browser_account", self.db.get_browser_account(account.id))
         if phones:
@@ -756,6 +847,61 @@ class JobManager:
             self.db.count_reveal_events(account_id, 3600),
         )
 
+    def _account_blocked(
+        self,
+        row: dict[str, Any],
+        account_id: int,
+        *,
+        r10: int | None = None,
+        r1h: int | None = None,
+    ) -> str | None:
+        cap_10m, cap_1h = self._rate_caps()
+        if r10 is None or r1h is None:
+            r10, r1h = self._reveal_counts(account_id)
+        blocked = account_rate_blocked(row, r10, r1h, cap_10m=cap_10m, cap_1h=cap_1h)
+        if blocked:
+            return blocked
+        egress = egress_group_key(row.get("proxy_url"))
+        er10, er1h = self._egress_reveal_counts(egress)
+        return self._egress_blocked_reason_with_counts(egress, er10, er1h)
+
+    def _egress_blocked_reason_with_counts(self, egress: str, r10: int, r1h: int) -> str | None:
+        cap_10m, cap_1h = self._rate_caps()
+        row = self.db.get_egress_group(egress)
+        return egress_rate_blocked(
+            row,
+            r10,
+            r1h,
+            cap_10m=cap_10m,
+            cap_1h=cap_1h,
+            views_today=self._egress_views_today(egress),
+            daily_cap=self._egress_daily_cap(),
+        )
+
+    async def _wait_for_any_egress_account(self, job_id: int, *, max_rounds: int = 500) -> bool:
+        """Wait while every egress group is cooling down (panel keeps running)."""
+        for _ in range(max_rounds):
+            if self._pick_browser_account_for_rate() is not None:
+                return True
+            waits: list[float] = []
+            for group in self.db.list_egress_groups():
+                key = str(group.get("egress_group") or "")
+                reason = self._egress_blocked_reason(key)
+                if reason in {"egress_cooldown", "egress_rolling_10m", "egress_rolling_1h"}:
+                    waits.append(self._egress_wait_seconds(key, reason))
+            if not waits:
+                return self._pick_browser_account() is not None
+            wait = min(max(waits), 120.0)
+            mins = wait / 60
+            self._log(
+                job_id,
+                f"همه گروه‌های خروجی مکث دارند؛ ~{mins:.0f} دقیقه صبر",
+                "warn",
+            )
+            if not await self._sleep_interruptible(job_id, wait):
+                return False
+        return False
+
     def _rolling_wait_seconds(self, account_id: int, reason: str) -> float:
         window = 600 if reason == "rolling_10m" else 3600
         oldest = self.db.oldest_reveal_in_window(account_id, window)
@@ -791,7 +937,7 @@ class JobManager:
                 account = alt
                 continue
             r10, r1h = self._reveal_counts(account.id)
-            blocked = account_rate_blocked(row, r10, r1h, cap_10m=cap_10m, cap_1h=cap_1h)
+            blocked = self._account_blocked(row, account.id, r10=r10, r1h=r1h)
             if not blocked:
                 return account
             alt = self._pick_browser_account_for_rate(exclude_id=account.id)
@@ -800,6 +946,14 @@ class JobManager:
                 continue
             if blocked in {"rolling_10m", "rolling_1h"}:
                 wait = self._rolling_wait_seconds(account.id, blocked)
+            elif blocked in {"egress_rolling_10m", "egress_rolling_1h"}:
+                egress = egress_group_key(row.get("proxy_url"))
+                wait = self._egress_wait_seconds(egress, blocked)
+            elif blocked == "egress_cooldown":
+                egress = egress_group_key(row.get("proxy_url"))
+                wait = self._egress_wait_seconds(egress, blocked)
+            elif blocked == "egress_daily":
+                wait = 3600.0
             elif blocked == "cooldown":
                 wait = self._cooldown_wait_seconds(row)
             elif blocked == "benched":
@@ -817,18 +971,25 @@ class JobManager:
                 return None
         return None
 
-    def _pick_browser_account_for_rate(self, exclude_id: int | None = None) -> AccountView | None:
-        cap_10m, cap_1h = self._rate_caps()
+    def _pick_browser_account_for_rate(
+        self,
+        exclude_id: int | None = None,
+        *,
+        exclude_egress: str | None = None,
+    ) -> AccountView | None:
         today = today_key()
         candidates: list[AccountView] = []
         for row in self.db.list_browser_accounts():
-            if exclude_id is not None and int(row["id"]) == int(exclude_id):
+            internal = self.db.get_browser_account(int(row["id"]), internal=True) or row
+            if exclude_id is not None and int(internal["id"]) == int(exclude_id):
                 continue
-            view = account_view_from_row(row)
+            eg = egress_group_key(internal.get("proxy_url"))
+            if exclude_egress and eg == exclude_egress:
+                continue
+            view = account_view_from_row(internal)
             if not available(view, today):
                 continue
-            r10, r1h = self._reveal_counts(int(row["id"]))
-            if account_rate_blocked(row, r10, r1h, cap_10m=cap_10m, cap_1h=cap_1h):
+            if self._account_blocked(internal, int(internal["id"])):
                 continue
             candidates.append(view)
         if not candidates:
@@ -839,25 +1000,39 @@ class JobManager:
 
     def _active_browser_accounts(self) -> list[AccountView]:
         today = today_key()
-        cap_10m, cap_1h = self._rate_caps()
         views: list[AccountView] = []
         for row in self.db.list_browser_accounts():
-            view = account_view_from_row(row)
+            internal = self.db.get_browser_account(int(row["id"]), internal=True) or row
+            view = account_view_from_row(internal)
             if not available(view, today):
                 continue
-            r10, r1h = self._reveal_counts(int(row["id"]))
-            if account_rate_blocked(row, r10, r1h, cap_10m=cap_10m, cap_1h=cap_1h):
+            if self._account_blocked(internal, int(internal["id"])):
                 continue
             views.append(view)
         return views
 
     async def _mark_account_captcha(self, job_id: int, account_id: int) -> str:
-        row = self.db.get_browser_account(account_id) or {}
+        row = self.db.get_browser_account(account_id, internal=True) or {}
         label = str(row.get("phone") or row.get("label") or f"#{account_id}")
         cooldown = clamp_captcha_cooldown_sec(float(self.db.setting("captcha_cooldown_sec") or 2700))
         penalty = apply_captcha_penalty_fields(row, cooldown, today_key=today_key())
         self.db.update_browser_account(account_id, **penalty)
-        self.db.record_reveal_event(account_id, kind="captcha", job_id=job_id)
+        egress = egress_group_key(row.get("proxy_url"))
+        egress_cd = clamp_egress_captcha_cooldown_sec(
+            float(self.db.setting("egress_captcha_cooldown_sec") or 5400)
+        )
+        until = tehran_now() + timedelta(seconds=egress_cd)
+        self.db.pause_egress_group(
+            egress,
+            until_iso=until.isoformat(timespec="seconds"),
+            last_error=scrub_secrets("captcha on egress group", row.get("proxy_url")),
+        )
+        self.db.record_reveal_event(
+            account_id,
+            kind="captcha",
+            job_id=job_id,
+            egress_group_key=egress,
+        )
         updated = self.db.get_browser_account(account_id)
         self.hub.publish("browser_account", updated)
         status = self.browsers.note_captcha(
@@ -884,14 +1059,28 @@ class JobManager:
         session: Any = None,
     ) -> AccountView | None:
         label = await self._mark_account_captcha(job_id, account_id)
-        other = self._pick_browser_account_excluding(account_id)
+        blocked_egress = egress_group_key(row.get("proxy_url"))
+        other = self._pick_browser_account_excluding(account_id, exclude_egress=blocked_egress)
         if other is not None:
             self._log(
                 job_id,
-                f"کپچا روی اکانت {label}؛ ادامه با اکانت دیگر",
+                f"کپچا روی اکانت {label}؛ ادامه با اکانت روی خروجی دیگر",
                 "warn",
             )
             return other
+        wait_left = self._egress_wait_seconds(blocked_egress, "egress_cooldown")
+        if wait_left > 0:
+            mins = wait_left / 60
+            self._log(
+                job_id,
+                f"گروه خروجی {blocked_egress} تا ~{mins:.0f} دقیقه مکث (کپچا)",
+                "warn",
+            )
+            if not await self._sleep_interruptible(job_id, min(wait_left, 120.0)):
+                return None
+            alt = self._pick_browser_account_for_rate(exclude_egress=blocked_egress)
+            if alt is not None:
+                return alt
         self._log(
             job_id,
             f"کپچا روی اکانت {label} — VNC را باز کن، کپچا را حل کن، بعد در پنل «کپچا حل شد» را بزن",
@@ -922,7 +1111,10 @@ class JobManager:
                 f"کپچا حل شد ولی اکانت {label} تا {mins:.0f} دقیقه دیگر کنار گذاشته می‌شود",
                 "warn",
             )
-            alt = self._pick_browser_account_for_rate(exclude_id=account_id)
+            alt = self._pick_browser_account_for_rate(
+                exclude_id=account_id,
+                exclude_egress=egress_group_key(row.get("proxy_url")),
+            )
             return alt
         self.db.update_browser_account(account_id, status="active", last_error=None)
         self.hub.publish("browser_account", self.db.get_browser_account(account_id))
@@ -939,12 +1131,32 @@ class JobManager:
     ) -> None:
         await self._resolve_captcha_or_switch(job_id, account_id, session=session)
 
-    def _pick_browser_account_excluding(self, exclude_id: int) -> AccountView | None:
-        accounts = [a for a in self._active_browser_accounts() if a.id != int(exclude_id)]
+    def _pick_browser_account_excluding(
+        self,
+        exclude_id: int,
+        *,
+        exclude_egress: str | None = None,
+    ) -> AccountView | None:
+        accounts = []
+        for account in self._active_browser_accounts():
+            if account.id == int(exclude_id):
+                continue
+            if exclude_egress:
+                row = self.db.get_browser_account(account.id, internal=True) or {}
+                if egress_group_key(row.get("proxy_url")) == exclude_egress:
+                    continue
+            accounts.append(account)
         if not accounts:
             return None
         index = self._account_cursor % len(accounts)
         self._account_cursor = (index + 1) % len(accounts)
+        return accounts[index]
+
+    def _peek_browser_account(self) -> AccountView | None:
+        accounts = self._active_browser_accounts()
+        if not accounts:
+            return None
+        index = self._account_cursor % len(accounts)
         return accounts[index]
 
     def _pick_browser_account(self) -> AccountView | None:

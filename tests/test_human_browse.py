@@ -117,7 +117,13 @@ def test_captcha_switches_account_when_available(tmp_path):
 
         app.state.manager._resolve_captcha_or_switch = fake_resolve  # type: ignore[method-assign]
         app.state.db.update_browser_account(a1["id"], status="active", phone="09121111111")
-        app.state.db.update_browser_account(a2["id"], status="active", phone="09122222222")
+        app.state.db.update_browser_account(
+            a2["id"],
+            status="active",
+            phone="09122222222",
+            proxy_url="http://10.0.0.2:3128",
+        )
+        app.state.manager._account_cursor = 0
         job_id = client.post(
             "/api/jobs",
             json={"category": "beauty-and-haircare", "fetch_phones": True, "max_pages": 1},

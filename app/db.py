@@ -44,9 +44,18 @@ CREATE TABLE IF NOT EXISTS browser_accounts (
     captcha_cooldown_until TEXT,
     captcha_hits_today INTEGER NOT NULL DEFAULT 0,
     captcha_hits_day TEXT,
+    proxy_url TEXT,
+    fingerprint_json TEXT,
     last_error TEXT,
     last_used_at TEXT,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS egress_groups (
+    egress_group TEXT PRIMARY KEY,
+    views_today INTEGER NOT NULL DEFAULT 0,
+    views_day TEXT,
+    captcha_cooldown_until TEXT,
+    last_error TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,6 +114,7 @@ CREATE TABLE IF NOT EXISTS reveal_events (
     job_id INTEGER,
     token TEXT,
     seconds_since_prev REAL,
+    egress_group TEXT,
     created_at TEXT NOT NULL
 );
 """
@@ -119,6 +129,8 @@ DEFAULTS = {
     "reveals_per_10_min": "5",
     "reveals_per_hour": "20",
     "captcha_cooldown_sec": "2700",
+    "egress_daily_cap": "50",
+    "egress_captcha_cooldown_sec": "5400",
 }
 
 
@@ -163,6 +175,15 @@ class Database:
             )
         if "captcha_hits_day" not in browser_cols:
             self._conn.execute("ALTER TABLE browser_accounts ADD COLUMN captcha_hits_day TEXT")
+        if "proxy_url" not in browser_cols:
+            self._conn.execute("ALTER TABLE browser_accounts ADD COLUMN proxy_url TEXT")
+        if "fingerprint_json" not in browser_cols:
+            self._conn.execute("ALTER TABLE browser_accounts ADD COLUMN fingerprint_json TEXT")
+        reveal_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(reveal_events)").fetchall()
+        }
+        if "egress_group" not in reveal_cols:
+            self._conn.execute("ALTER TABLE reveal_events ADD COLUMN egress_group TEXT")
         self._migrate_legacy_rate_values()
 
     def _migrate_legacy_rate_values(self) -> None:
@@ -556,52 +577,87 @@ class Database:
             self._conn.commit()
 
     def add_browser_account(self, fields: dict[str, Any]) -> dict[str, Any]:
+        from app.fingerprint import ensure_fingerprint_json
+        from app.proxy_util import normalize_proxy_input
         from app.rate_policy import clamp_daily_cap, clamp_phone_delays, DEFAULT_DAILY_CAP
 
         stamp = now_iso()
         label = (fields.get("label") or "").strip() or "اکانت Chromium"
         lo, hi = clamp_phone_delays(fields.get("delay_min"), fields.get("delay_max"))
         cap = clamp_daily_cap(fields.get("daily_cap"), default=DEFAULT_DAILY_CAP)
+        proxy_url = normalize_proxy_input(fields.get("proxy_url"))
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO browser_accounts(
                     label, phone, status, daily_cap, views_today, views_day,
-                    delay_min, delay_max, created_at
-                ) VALUES (?, NULL, 'needs_login', ?, 0, ?, ?, ?, ?)""",
+                    delay_min, delay_max, proxy_url, fingerprint_json, created_at
+                ) VALUES (?, NULL, 'needs_login', ?, 0, ?, ?, ?, ?, NULL, ?)""",
                 (
                     label,
                     cap,
                     today_key(),
                     lo,
                     hi,
+                    proxy_url,
                     stamp,
                 ),
             )
+            account_id = int(cur.lastrowid)
+            fp_json = ensure_fingerprint_json(account_id, None)
+            self._conn.execute(
+                "UPDATE browser_accounts SET fingerprint_json=? WHERE id=?",
+                (fp_json, account_id),
+            )
+            self._ensure_egress_group(proxy_url)
             self._conn.commit()
             row = self._conn.execute(
-                "SELECT * FROM browser_accounts WHERE id=?", (cur.lastrowid,)
+                "SELECT * FROM browser_accounts WHERE id=?", (account_id,)
             ).fetchone()
-        return dict(row)
+        return public_browser_account(row)
 
     def list_browser_accounts(self) -> list[dict[str, Any]]:
         self._roll_browser_daily_caps()
+        self._roll_egress_daily_caps()
         with self._lock:
             rows = self._conn.execute("SELECT * FROM browser_accounts ORDER BY id").fetchall()
-        return [dict(row) for row in rows]
+        egress = {item["egress_group"]: item for item in self.list_egress_groups()}
+        out: list[dict[str, Any]] = []
+        cap_default = int(float(self.setting("egress_daily_cap") or 50))
+        for row in rows:
+            acc = public_browser_account(row)
+            eg = acc.get("egress_group")
+            if eg and eg in egress:
+                g = egress[eg]
+                acc["egress_views_today"] = int(g.get("views_today") or 0)
+                acc["egress_daily_cap"] = cap_default
+                acc["egress_cooldown_until"] = g.get("captcha_cooldown_until")
+                acc["egress_last_error"] = g.get("last_error")
+            out.append(acc)
+        return out
 
-    def get_browser_account(self, account_id: int) -> dict[str, Any] | None:
+    def get_browser_account(self, account_id: int, *, internal: bool = False) -> dict[str, Any] | None:
         self._roll_browser_daily_caps()
+        self._roll_egress_daily_caps()
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM browser_accounts WHERE id=?", (account_id,)
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        data = dict(row)
+        return data if internal else public_browser_account(row)
 
     def update_browser_account(self, account_id: int, **fields: Any) -> dict[str, Any] | None:
         if not fields:
             return self.get_browser_account(account_id)
+        if "proxy_url" in fields:
+            from app.proxy_util import normalize_proxy_input
+
+            fields["proxy_url"] = normalize_proxy_input(fields.get("proxy_url"))
         cols = ", ".join(f"{key}=?" for key in fields)
         with self._lock:
+            if "proxy_url" in fields:
+                self._ensure_egress_group(fields.get("proxy_url"))
             self._conn.execute(
                 f"UPDATE browser_accounts SET {cols} WHERE id=?",
                 (*fields.values(), account_id),
@@ -610,7 +666,9 @@ class Database:
             row = self._conn.execute(
                 "SELECT * FROM browser_accounts WHERE id=?", (account_id,)
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        return public_browser_account(row)
 
     def delete_browser_account(self, account_id: int) -> None:
         with self._lock:
@@ -618,8 +676,23 @@ class Database:
             self._conn.commit()
 
     def bump_browser_account_view(self, account_id: int) -> None:
+        from app.proxy_util import egress_group as egress_key
+
         day = today_key()
         with self._lock:
+            row = self._conn.execute(
+                "SELECT proxy_url FROM browser_accounts WHERE id=?", (account_id,)
+            ).fetchone()
+            if row:
+                self._ensure_egress_group(row["proxy_url"])
+                eg = egress_key(row["proxy_url"])
+                self._conn.execute(
+                    """UPDATE egress_groups
+                       SET views_today = CASE WHEN views_day=? THEN views_today+1 ELSE 1 END,
+                           views_day=?
+                       WHERE egress_group=?""",
+                    (day, day, eg),
+                )
             self._conn.execute(
                 """UPDATE browser_accounts
                    SET views_today = CASE WHEN views_day=? THEN views_today+1 ELSE 1 END,
@@ -662,6 +735,105 @@ class Database:
                 (day, day, day, day, day, day),
             )
             self._conn.commit()
+
+    def _roll_egress_daily_caps(self) -> None:
+        day = today_key()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE egress_groups
+                   SET views_today=0, views_day=?
+                   WHERE views_day IS NULL OR views_day!=?""",
+                (day, day),
+            )
+            self._conn.commit()
+
+    def _ensure_egress_group(self, proxy_url: str | None) -> None:
+        from app.proxy_util import egress_group as egress_key
+
+        key = egress_key(proxy_url)
+        self._conn.execute(
+            """INSERT INTO egress_groups(egress_group, views_today, views_day)
+               VALUES (?, 0, ?) ON CONFLICT(egress_group) DO NOTHING""",
+            (key, today_key()),
+        )
+
+    def get_egress_group(self, egress_group_key: str) -> dict[str, Any] | None:
+        self._roll_egress_daily_caps()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM egress_groups WHERE egress_group=?", (egress_group_key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_egress_groups(self) -> list[dict[str, Any]]:
+        self._roll_egress_daily_caps()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM egress_groups ORDER BY egress_group").fetchall()
+        return [dict(row) for row in rows]
+
+    def pause_egress_group(
+        self,
+        egress_group_key: str,
+        *,
+        until_iso: str,
+        last_error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO egress_groups(egress_group, views_today, views_day)
+                   VALUES (?, 0, ?) ON CONFLICT(egress_group) DO NOTHING""",
+                (egress_group_key, today_key()),
+            )
+            self._conn.execute(
+                """UPDATE egress_groups
+                   SET captcha_cooldown_until=?, last_error=?
+                   WHERE egress_group=?""",
+                (until_iso, last_error, egress_group_key),
+            )
+            self._conn.commit()
+
+    def clear_egress_group_captcha(self, egress_group_key: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """UPDATE egress_groups
+                   SET captcha_cooldown_until=NULL, last_error=NULL
+                   WHERE egress_group=?""",
+                (egress_group_key,),
+            )
+            self._conn.commit()
+
+    def count_reveal_events_for_egress(
+        self, egress_group_key: str, window_sec: int, *, kind: str = "reveal"
+    ) -> int:
+        from datetime import timedelta
+
+        cutoff = (datetime.now(TEHRAN) - timedelta(seconds=max(1, int(window_sec)))).isoformat(
+            timespec="seconds"
+        )
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT COUNT(*) c FROM reveal_events
+                   WHERE egress_group=? AND kind=? AND created_at>=?""",
+                (egress_group_key, kind, cutoff),
+            ).fetchone()
+        return int(row["c"] or 0)
+
+    def oldest_reveal_in_window_egress(
+        self, egress_group_key: str, window_sec: int, *, kind: str = "reveal"
+    ) -> str | None:
+        from datetime import timedelta
+
+        cutoff = (datetime.now(TEHRAN) - timedelta(seconds=max(1, int(window_sec)))).isoformat(
+            timespec="seconds"
+        )
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT created_at FROM reveal_events
+                   WHERE egress_group=? AND kind=? AND created_at>=?
+                   ORDER BY created_at ASC LIMIT 1""",
+                (egress_group_key, kind, cutoff),
+            ).fetchone()
+        return str(row["created_at"]) if row else None
 
     def oldest_reveal_in_window(
         self, account_id: int, window_sec: int, *, kind: str = "reveal"
@@ -712,8 +884,17 @@ class Database:
         job_id: int | None = None,
         token: str | None = None,
         seconds_since_prev: float | None = None,
+        egress_group_key: str | None = None,
     ) -> dict[str, Any]:
         stamp = now_iso()
+        if egress_group_key is None:
+            from app.proxy_util import egress_group as egress_key
+
+            with self._lock:
+                prow = self._conn.execute(
+                    "SELECT proxy_url FROM browser_accounts WHERE id=?", (account_id,)
+                ).fetchone()
+            egress_group_key = egress_key(prow["proxy_url"] if prow else None)
         with self._lock:
             prev = self._conn.execute(
                 """SELECT created_at FROM reveal_events
@@ -731,9 +912,9 @@ class Database:
                     gap = None
             cur = self._conn.execute(
                 """INSERT INTO reveal_events(
-                    kind, account_id, job_id, token, seconds_since_prev, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
-                (kind, account_id, job_id, token, gap, stamp),
+                    kind, account_id, job_id, token, seconds_since_prev, egress_group, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (kind, account_id, job_id, token, gap, egress_group_key, stamp),
             )
             self._conn.commit()
             row = self._conn.execute(
@@ -745,6 +926,7 @@ class Database:
         self,
         *,
         account_id: int | None = None,
+        egress_group: str | None = None,
         kind: str | None = None,
         limit: int = 200,
         offset: int = 0,
@@ -754,6 +936,9 @@ class Database:
         if account_id is not None:
             sql += " AND account_id=?"
             args.append(account_id)
+        if egress_group:
+            sql += " AND egress_group=?"
+            args.append(egress_group)
         if kind:
             sql += " AND kind=?"
             args.append(kind)
@@ -776,6 +961,34 @@ def _job(row: sqlite3.Row) -> dict[str, Any]:
     data["loop"] = bool(data.get("loop") or 0)
     data["source_url"] = data.get("source_url") or None
     data["query_done"] = bool(data["query_done"])
+    return data
+
+
+def public_browser_account(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    from app.fingerprint import parse_fingerprint
+    from app.proxy_util import egress_group as egress_key
+    from app.proxy_util import egress_group_label, public_proxy_fields
+
+    data = dict(row)
+    proxy_raw = data.get("proxy_url")
+    extra = public_proxy_fields(proxy_raw if isinstance(proxy_raw, str) else None)
+    data.update(extra)
+    data.pop("proxy_url", None)
+    if proxy_raw and isinstance(proxy_raw, str) and str(proxy_raw).strip():
+        data["proxy_url_masked"] = extra.get("proxy_url")
+    fp = parse_fingerprint(data.get("fingerprint_json") if isinstance(data.get("fingerprint_json"), str) else None)
+    if fp:
+        data["fingerprint"] = {
+            "profile_name": fp.get("profile_name"),
+            "user_agent_preview": (fp.get("user_agent") or "")[:72] + "…",
+            "mobile": fp.get("mobile"),
+            "viewport": fp.get("viewport"),
+        }
+    eg = data.get("egress_group") or egress_key(proxy_raw if isinstance(proxy_raw, str) else None)
+    data["egress_group"] = eg
+    data["egress_label"] = data.get("egress_label") or egress_group_label(
+        proxy_raw if isinstance(proxy_raw, str) else None
+    )
     return data
 
 

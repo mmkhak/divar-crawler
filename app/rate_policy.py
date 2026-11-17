@@ -28,6 +28,12 @@ DEFAULT_CAPTCHA_COOLDOWN_SEC = 45 * 60
 MIN_CAPTCHA_COOLDOWN_SEC = 30 * 60
 MAX_CAPTCHA_COOLDOWN_SEC = 60 * 60
 
+DEFAULT_EGRESS_DAILY_CAP = 50
+MAX_EGRESS_DAILY_CAP = 150
+DEFAULT_EGRESS_CAPTCHA_COOLDOWN_SEC = 90 * 60
+MIN_EGRESS_CAPTCHA_COOLDOWN_SEC = 30 * 60
+MAX_EGRESS_CAPTCHA_COOLDOWN_SEC = 6 * 60 * 60
+
 REFRESH_BACKOFF_START_SEC = 5 * 60
 REFRESH_BACKOFF_MAX_SEC = 30 * 60
 REFRESH_BACKOFF_JITTER = 0.1
@@ -68,6 +74,43 @@ def clamp_setting_int(
 def clamp_captcha_cooldown_sec(value: float | int | None) -> float:
     parsed = float(value if value is not None else DEFAULT_CAPTCHA_COOLDOWN_SEC)
     return max(MIN_CAPTCHA_COOLDOWN_SEC, min(parsed, MAX_CAPTCHA_COOLDOWN_SEC))
+
+
+def clamp_egress_daily_cap(value: int | float | None, *, default: int = DEFAULT_EGRESS_DAILY_CAP) -> int:
+    cap = int(value if value is not None else default)
+    return max(1, min(cap, MAX_EGRESS_DAILY_CAP))
+
+
+def clamp_egress_captcha_cooldown_sec(value: float | int | None) -> float:
+    parsed = float(value if value is not None else DEFAULT_EGRESS_CAPTCHA_COOLDOWN_SEC)
+    return max(
+        MIN_EGRESS_CAPTCHA_COOLDOWN_SEC,
+        min(parsed, MAX_EGRESS_CAPTCHA_COOLDOWN_SEC),
+    )
+
+
+def egress_rate_blocked(
+    egress_row: dict[str, Any] | None,
+    reveals_10m: int,
+    reveals_1h: int,
+    *,
+    cap_10m: int,
+    cap_1h: int,
+    views_today: int,
+    daily_cap: int,
+    now: datetime | None = None,
+) -> str | None:
+    now = now or tehran_now()
+    if views_today >= daily_cap:
+        return "egress_daily"
+    until = parse_iso((egress_row or {}).get("captcha_cooldown_until"))
+    if until and now < until:
+        return "egress_cooldown"
+    if reveals_10m >= cap_10m:
+        return "egress_rolling_10m"
+    if reveals_1h >= cap_1h:
+        return "egress_rolling_1h"
+    return None
 
 
 def phone_reveal_wait(
