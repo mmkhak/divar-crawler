@@ -57,6 +57,8 @@ class SettingsIn(BaseModel):
     default_daily_cap: int = 50
     delay_min: float = 20
     delay_max: float = 40
+    phone_batch_size: int = 4
+    phone_batch_pause_sec: float = 300
 
 
 class CodeRequest(BaseModel):
@@ -149,12 +151,18 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             raise HTTPException(400, "نرخ درخواست باید بین ۰ و ۵ باشد")
         if body.delay_min < 5:
             raise HTTPException(400, "حداقل فاصله شماره ۵ ثانیه است")
+        if body.phone_batch_size < 1 or body.phone_batch_size > 50:
+            raise HTTPException(400, "اندازه بسته باید بین ۱ و ۵۰ باشد")
+        if body.phone_batch_pause_sec < 0:
+            raise HTTPException(400, "مکث بسته نمی‌تواند منفی باشد")
         saved = db.update_settings(
             {
                 "anon_rps": str(body.anon_rps),
                 "default_daily_cap": str(body.default_daily_cap),
                 "delay_min": str(body.delay_min),
                 "delay_max": str(body.delay_max),
+                "phone_batch_size": str(int(body.phone_batch_size)),
+                "phone_batch_pause_sec": str(body.phone_batch_pause_sec),
             }
         )
         manager.refresh_rate()

@@ -210,7 +210,14 @@ def test_fetch_phones_human_browse_opens_ads_one_by_one(tmp_path):
         session.collect_list_ads = collect_list_ads
         session.open_ad_from_list = open_ad_from_list
         app.state.db.update_settings(
-            {"anon_rps": "20", "default_daily_cap": "50", "delay_min": "0.01", "delay_max": "0.01"}
+            {
+                "anon_rps": "20",
+                "default_daily_cap": "50",
+                "delay_min": "0.01",
+                "delay_max": "0.01",
+                "phone_batch_size": "4",
+                "phone_batch_pause_sec": "0.01",
+            }
         )
         app.state.manager.refresh_rate()
         created = client.post(

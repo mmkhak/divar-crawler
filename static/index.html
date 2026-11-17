@@ -143,6 +143,10 @@
         <label>تأخیر پیش‌فرض از <input name="delay_min" type="number" value="20" /></label>
         <label>تا <input name="delay_max" type="number" value="40" /></label>
       </div>
+      <div class="row">
+        <label>هر چند شماره پشت‌سرهم <input name="phone_batch_size" type="number" value="4" min="1" max="50" /></label>
+        <label>بعد مکث (ثانیه) <input name="phone_batch_pause_sec" type="number" value="300" min="0" /></label>
+      </div>
       <button type="submit">ذخیره</button>
       <button type="button" id="refresh-cities">به‌روزرسانی فهرست شهرها</button>
       <p id="settings-msg" class="muted"></p>

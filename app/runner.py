@@ -180,6 +180,9 @@ class JobManager:
             max_pages = max(1, int(job.get("max_pages") or 5))
             switch_account = False
             list_finished = False
+            batch_size = max(1, int(float(self.db.setting("phone_batch_size") or 4)))
+            batch_pause = max(0.0, float(self.db.setting("phone_batch_pause_sec") or 300))
+            batch_count = 0
             while page_rounds < max_pages:
                 if not await self._wait_controls(job_id):
                     self.db.set_status(job_id, "stopped")
@@ -245,8 +248,14 @@ class JobManager:
                     else:
                         saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
 
+                    # Inside a batch of N, keep gaps short; long rest happens after the batch.
                     result = await self._human_open_ad(
-                        job_id, saved, account, session, list_url
+                        job_id,
+                        saved,
+                        account,
+                        session,
+                        list_url,
+                        pre_wait=jitter(1.0, 3.0),
                     )
                     if result == "stop":
                         self.db.set_status(job_id, "stopped")
@@ -257,6 +266,21 @@ class JobManager:
                         break
                     if result == "reopen_list":
                         await session.open_search_list(list_url)
+                        continue
+                    if result in {"ok", "error"}:
+                        batch_count += 1
+                        if batch_count >= batch_size and batch_pause > 0:
+                            mins = batch_pause / 60
+                            self._log(
+                                job_id,
+                                f"{batch_size} شماره پشت‌سرهم گرفته شد؛ {mins:.0f} دقیقه صبر",
+                            )
+                            if not await self._sleep_interruptible(job_id, batch_pause):
+                                self.db.set_status(job_id, "stopped")
+                                self._emit_job(job_id)
+                                return
+                            batch_count = 0
+                            await session.open_search_list(list_url)
                 if switch_account:
                     break
                 self._log(
@@ -315,6 +339,18 @@ class JobManager:
             keywords=list(job.get("keywords") or []),
         )
 
+    async def _sleep_interruptible(self, job_id: int, seconds: float) -> bool:
+        """Sleep in chunks so pause/stop still work. False = stop."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, seconds)
+        while True:
+            if not await self._wait_controls(job_id):
+                return False
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return True
+            await asyncio.sleep(min(1.0, remaining))
+
     async def _human_open_ad(
         self,
         job_id: int,
@@ -322,14 +358,19 @@ class JobManager:
         account: AccountView,
         session: Any,
         list_url: str,
+        pre_wait: float | None = None,
     ) -> str:
         row = self.db.get_browser_account(account.id) or {}
-        delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
-        delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
-        wait = jitter(delay_min, delay_max)
+        if pre_wait is None:
+            delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
+            delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
+            wait = jitter(delay_min, delay_max)
+        else:
+            wait = max(0.0, float(pre_wait))
         label = row.get("phone") or row.get("label") or f"#{account.id}"
         self._log(job_id, f"باز کردن آگهی {listing['token']} با {label} بعد از {wait:.0f}ث")
-        await asyncio.sleep(wait)
+        if wait > 0 and not await self._sleep_interruptible(job_id, wait):
+            return "stop"
         if not await self._wait_controls(job_id):
             return "stop"
         try:

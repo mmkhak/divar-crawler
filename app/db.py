@@ -102,6 +102,8 @@ DEFAULTS = {
     "default_daily_cap": "50",
     "delay_min": "20",
     "delay_max": "40",
+    "phone_batch_size": "4",
+    "phone_batch_pause_sec": "300",
 }
 
 
