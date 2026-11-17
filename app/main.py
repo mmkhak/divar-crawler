@@ -20,7 +20,19 @@ from app.divar.traffic import TrafficBuffer
 from app.divar.urls import resolve_divar_search_url
 from app.exporting import listing_row, to_csv, to_xlsx
 from app.hub import EventHub
-from app.runner import JobManager, city_name
+from app.rate_policy import (
+    MAX_DAILY_CAP,
+    MAX_REVEALS_PER_10_MIN,
+    MAX_REVEALS_PER_HOUR,
+    MIN_PHONE_DELAY_SEC,
+    clamp_captcha_cooldown_sec,
+    clamp_daily_cap,
+    clamp_phone_delays,
+    clamp_setting_int,
+    parse_iso,
+    tehran_now,
+)
+from app.runner import HumanBrowseConflictError, JobManager, city_name
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
@@ -54,11 +66,14 @@ class JobFromUrlIn(BaseModel):
 
 class SettingsIn(BaseModel):
     anon_rps: float = 1
-    default_daily_cap: int = 50
-    delay_min: float = 20
-    delay_max: float = 40
+    default_daily_cap: int = 80
+    delay_min: float = 25
+    delay_max: float = 45
     phone_batch_size: int = 4
-    phone_batch_pause_sec: float = 300
+    phone_batch_pause_sec: float = 600
+    reveals_per_10_min: int = 5
+    reveals_per_hour: int = 20
+    captcha_cooldown_sec: float = 2700
 
 
 class CodeRequest(BaseModel):
@@ -70,16 +85,16 @@ class CodeConfirm(BaseModel):
     phone: str
     code: str
     proxy: str | None = None
-    daily_cap: int = 50
-    delay_min: float = 20
-    delay_max: float = 40
+    daily_cap: int = 80
+    delay_min: float = 25
+    delay_max: float = 45
 
 
 class BrowserAccountIn(BaseModel):
     label: str = ""
-    daily_cap: int = 50
-    delay_min: float = 20
-    delay_max: float = 40
+    daily_cap: int = 80
+    delay_min: float = 25
+    delay_max: float = 45
 
 
 class BrowserAccountUpdate(BaseModel):
@@ -149,20 +164,37 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     async def put_settings(body: SettingsIn) -> dict[str, str]:
         if body.anon_rps <= 0 or body.anon_rps > 5:
             raise HTTPException(400, "نرخ درخواست باید بین ۰ و ۵ باشد")
-        if body.delay_min < 5:
-            raise HTTPException(400, "حداقل فاصله شماره ۵ ثانیه است")
+        delay_min, delay_max = clamp_phone_delays(body.delay_min, body.delay_max)
+        if body.delay_min < MIN_PHONE_DELAY_SEC or body.delay_max < MIN_PHONE_DELAY_SEC:
+            raise HTTPException(
+                400,
+                f"حداقل فاصله بین هر شماره حداقل {int(MIN_PHONE_DELAY_SEC)} ثانیه است (در کد هم اجبار می‌شود)",
+            )
+        if delay_max < delay_min:
+            raise HTTPException(400, "بیشترین تأخیر نباید از کمترین کمتر باشد")
+        cap_default = clamp_daily_cap(body.default_daily_cap)
+        if body.default_daily_cap > MAX_DAILY_CAP:
+            raise HTTPException(400, f"سقف روزانه پیش‌فرض حداکثر {MAX_DAILY_CAP} است")
         if body.phone_batch_size < 1 or body.phone_batch_size > 50:
             raise HTTPException(400, "اندازه بسته باید بین ۱ و ۵۰ باشد")
         if body.phone_batch_pause_sec < 0:
             raise HTTPException(400, "مکث بسته نمی‌تواند منفی باشد")
+        reveals_10m = clamp_setting_int(
+            body.reveals_per_10_min, default=5, upper=MAX_REVEALS_PER_10_MIN
+        )
+        reveals_1h = clamp_setting_int(body.reveals_per_hour, default=20, upper=MAX_REVEALS_PER_HOUR)
+        captcha_cd = clamp_captcha_cooldown_sec(body.captcha_cooldown_sec)
         saved = db.update_settings(
             {
                 "anon_rps": str(body.anon_rps),
-                "default_daily_cap": str(body.default_daily_cap),
-                "delay_min": str(body.delay_min),
-                "delay_max": str(body.delay_max),
+                "default_daily_cap": str(cap_default),
+                "delay_min": str(delay_min),
+                "delay_max": str(delay_max),
                 "phone_batch_size": str(int(body.phone_batch_size)),
                 "phone_batch_pause_sec": str(body.phone_batch_pause_sec),
+                "reveals_per_10_min": str(reveals_10m),
+                "reveals_per_hour": str(reveals_1h),
+                "captcha_cooldown_sec": str(int(captcha_cd)),
             }
         )
         manager.refresh_rate()
@@ -234,7 +266,14 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         job["counts"] = db.job_counts(job["id"])
         job["resolved_from"] = resolved.get("resolved_from")
         if body.start:
-            manager.start(job["id"])
+            try:
+                manager.start(job["id"])
+            except HumanBrowseConflictError as exc:
+                other = int(exc.args[0]) if exc.args else 0
+                raise HTTPException(
+                    409,
+                    f"یک کار خزش انسانی دیگر (شناسه {other}) همین‌الان روی این سرور/IP فعال است.",
+                ) from exc
             job = db.get_job(job["id"]) or job
             job["counts"] = db.job_counts(job["id"])
             job["resolved_from"] = resolved.get("resolved_from")
@@ -242,8 +281,16 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/jobs/{job_id}/start")
     async def start_job(job_id: int) -> dict[str, Any]:
-        _require_job(db, job_id)
-        manager.start(job_id)
+        job = _require_job(db, job_id)
+        try:
+            manager.start(job_id)
+        except HumanBrowseConflictError as exc:
+            other = int(exc.args[0]) if exc.args else 0
+            raise HTTPException(
+                409,
+                f"یک کار خزش انسانی دیگر (شناسه {other}) همین‌الان روی این سرور/IP فعال است. "
+                "اول آن را متوقف کنید یا صبر کنید تمام شود.",
+            ) from exc
         job = db.get_job(job_id)
         job["counts"] = db.job_counts(job_id)
         return job
@@ -270,7 +317,14 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         enabled = not bool(job.get("loop"))
         db.update_job(job_id, loop=enabled)
         if enabled and job["status"] in {"done", "stopped", "paused", "error"}:
-            manager.start(job_id)
+            try:
+                manager.start(job_id)
+            except HumanBrowseConflictError as exc:
+                other = int(exc.args[0]) if exc.args else 0
+                raise HTTPException(
+                    409,
+                    f"یک کار خزش انسانی دیگر (شناسه {other}) همین‌الان روی این سرور/IP فعال است.",
+                ) from exc
         job = db.get_job(job_id)
         job["counts"] = db.job_counts(job_id)
         return job
@@ -311,15 +365,39 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     async def browser_captcha_resolved() -> dict[str, Any]:
         blocked_id = browsers.captcha_status().get("account_id")
         status = browsers.resolve_captcha()
+
+        def _post_captcha_status(account_id: int) -> None:
+            row = db.get_browser_account(account_id) or {}
+            until = parse_iso(row.get("captcha_cooldown_until"))
+            if until and tehran_now() < until:
+                next_status = str(row.get("status") or "cooldown")
+                if next_status == "captcha":
+                    next_status = "cooldown"
+                restored = db.update_browser_account(
+                    account_id,
+                    status=next_status,
+                    last_error=row.get("last_error") or "post-captcha cooldown",
+                )
+            else:
+                restored = db.update_browser_account(account_id, status="active", last_error=None)
+            hub.publish("browser_account", restored)
+
         if blocked_id:
-            db.update_browser_account(int(blocked_id), status="active", last_error=None)
-            hub.publish("browser_account", db.get_browser_account(int(blocked_id)))
+            _post_captcha_status(int(blocked_id))
         for account in db.list_browser_accounts():
             if account.get("status") == "captcha":
-                restored = db.update_browser_account(account["id"], status="active", last_error=None)
-                hub.publish("browser_account", restored)
+                _post_captcha_status(int(account["id"]))
         hub.publish("captcha", status)
         return {"ok": True, **status}
+
+    @app.get("/api/reveal-events")
+    async def reveal_events(
+        account_id: int | None = None,
+        kind: str | None = None,
+        limit: int = Query(200, le=2000),
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return db.list_reveal_events(account_id=account_id, kind=kind, limit=limit, offset=offset)
 
     @app.post("/api/browser-accounts/{account_id}/focus")
     async def focus_browser_account(account_id: int) -> dict[str, Any]:
@@ -343,12 +421,19 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/browser-accounts")
     async def create_browser_account(body: BrowserAccountIn) -> dict[str, Any]:
+        if body.delay_min < MIN_PHONE_DELAY_SEC or body.delay_max < MIN_PHONE_DELAY_SEC:
+            raise HTTPException(
+                400,
+                f"حداقل فاصله بین هر شماره حداقل {int(MIN_PHONE_DELAY_SEC)} ثانیه است",
+            )
+        cap = clamp_daily_cap(body.daily_cap)
+        lo, hi = clamp_phone_delays(body.delay_min, body.delay_max)
         account = db.add_browser_account(
             {
                 "label": body.label,
-                "daily_cap": body.daily_cap,
-                "delay_min": body.delay_min,
-                "delay_max": body.delay_max,
+                "daily_cap": cap,
+                "delay_min": lo,
+                "delay_max": hi,
             }
         )
         hub.publish("browser_account", account)
@@ -367,20 +452,35 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if body.daily_cap is not None:
             if body.daily_cap < 1:
                 raise HTTPException(400, "سقف روزانه باید حداقل ۱ باشد")
-            fields["daily_cap"] = int(body.daily_cap)
+            if body.daily_cap > MAX_DAILY_CAP:
+                raise HTTPException(400, f"سقف روزانه هر اکانت حداکثر {MAX_DAILY_CAP} است")
+            fields["daily_cap"] = clamp_daily_cap(body.daily_cap)
             # If they raise the cap after hitting limit, allow the account again today.
             if account.get("status") == "limited" and int(body.daily_cap) > int(account.get("views_today") or 0):
                 fields["status"] = "active"
                 fields["last_error"] = None
         if body.delay_min is not None:
+            if body.delay_min < MIN_PHONE_DELAY_SEC:
+                raise HTTPException(
+                    400,
+                    f"حداقل فاصله بین هر شماره حداقل {int(MIN_PHONE_DELAY_SEC)} ثانیه است",
+                )
             fields["delay_min"] = float(body.delay_min)
         if body.delay_max is not None:
+            if body.delay_max < MIN_PHONE_DELAY_SEC:
+                raise HTTPException(
+                    400,
+                    f"حداقل فاصله بین هر شماره حداقل {int(MIN_PHONE_DELAY_SEC)} ثانیه است",
+                )
             fields["delay_max"] = float(body.delay_max)
         if not fields:
             return account
         if "delay_min" in fields or "delay_max" in fields:
-            delay_min = float(fields.get("delay_min", account.get("delay_min") or 20))
-            delay_max = float(fields.get("delay_max", account.get("delay_max") or 40))
+            delay_min = float(fields.get("delay_min", account.get("delay_min") or 25))
+            delay_max = float(fields.get("delay_max", account.get("delay_max") or 45))
+            lo, hi = clamp_phone_delays(delay_min, delay_max)
+            fields["delay_min"] = lo
+            fields["delay_max"] = hi
             if delay_max < delay_min:
                 raise HTTPException(400, "بیشترین تأخیر نباید از کمترین کمتر باشد")
         updated = db.update_browser_account(account_id, **fields)

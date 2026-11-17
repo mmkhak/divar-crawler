@@ -101,6 +101,8 @@ function browserStatusLabel(status) {
     active: "وصل شده",
     needs_login: "نیاز به لاگین",
     captcha: "نیاز به کپچا",
+    cooldown: "کول‌داون بعد کپچا",
+    benched: "کنار تا نیمه‌شب",
     limited: "سقف امروز",
     error: "خطا",
   }[status] || statusLabel(status);
@@ -120,13 +122,13 @@ function renderBrowserAccounts(list) {
         </div>
         <div class="row account-edit">
           <label>سقف روزانه
-            <input type="number" min="1" data-cap-input="${account.id}" value="${Number(account.daily_cap) || 50}" dir="ltr" />
+            <input type="number" min="1" max="150" data-cap-input="${account.id}" value="${Number(account.daily_cap) || 80}" dir="ltr" />
           </label>
           <label>تأخیر از
-            <input type="number" min="0" step="1" data-delay-min-input="${account.id}" value="${Number(account.delay_min) || 20}" dir="ltr" />
+            <input type="number" min="20" step="1" data-delay-min-input="${account.id}" value="${Number(account.delay_min) || 25}" dir="ltr" />
           </label>
           <label>تا
-            <input type="number" min="0" step="1" data-delay-max-input="${account.id}" value="${Number(account.delay_max) || 40}" dir="ltr" />
+            <input type="number" min="20" step="1" data-delay-max-input="${account.id}" value="${Number(account.delay_max) || 45}" dir="ltr" />
           </label>
           <button type="button" data-save="${account.id}">ذخیره سقف</button>
         </div>
