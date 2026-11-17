@@ -16,7 +16,7 @@ from app.accounts import AccountView, account_view_from_row, available
 from app.catalog import load_cities
 from app.db import Database, today_key
 from app.divar.browser import BrowserPool
-from app.divar.client import DivarClient, RateLimiter, build_search, jitter
+from app.divar.client import DivarClient, RateLimiter, build_search
 from app.divar.parse import (
     canonical_phones,
     matches_keywords,
@@ -28,8 +28,26 @@ from app.divar.traffic import TrafficBuffer
 from app.divar.urls import build_search_list_url
 from app.hub import EventHub
 from app.notify import notify_captcha
+from app.rate_policy import (
+    DEFAULT_REVEALS_PER_10_MIN,
+    DEFAULT_REVEALS_PER_HOUR,
+    account_rate_blocked,
+    apply_captcha_penalty_fields,
+    batch_pause_seconds,
+    clamp_captcha_cooldown_sec,
+    clamp_setting_int,
+    parse_iso,
+    phone_reveal_wait,
+    refresh_backoff_seconds,
+    tehran_now,
+)
 
 HUMAN_EMPTY_SCROLL_LIMIT = 4
+REFRESH_BACKOFF_MAX_STREAK = 4
+
+
+class HumanBrowseConflictError(RuntimeError):
+    """Another human-browse job is already running on this host/IP."""
 
 
 def human_list_page_cap(max_pages: int | None) -> int | None:
@@ -69,6 +87,28 @@ class JobManager:
         self._pause: dict[int, asyncio.Event] = {}
         self._stop: dict[int, asyncio.Event] = {}
         self._account_cursor = 0
+        self._human_browse_holder: int | None = None
+
+    def human_browse_active_job(self) -> int | None:
+        return self._human_browse_holder
+
+    def _release_human_browse(self, job_id: int) -> None:
+        if self._human_browse_holder == job_id:
+            self._human_browse_holder = None
+
+    def _rate_caps(self) -> tuple[int, int]:
+        settings = self.db.settings()
+        cap_10m = clamp_setting_int(
+            settings.get("reveals_per_10_min"),
+            default=DEFAULT_REVEALS_PER_10_MIN,
+            upper=12,
+        )
+        cap_1h = clamp_setting_int(
+            settings.get("reveals_per_hour"),
+            default=DEFAULT_REVEALS_PER_HOUR,
+            upper=40,
+        )
+        return cap_10m, cap_1h
 
     def refresh_rate(self) -> None:
         self.limiter.set_rps(float(self.db.setting("anon_rps") or 1))
@@ -77,6 +117,10 @@ class JobManager:
         job = self.db.get_job(job_id)
         if not job:
             raise KeyError(job_id)
+        if job.get("fetch_phones"):
+            holder = self._human_browse_holder
+            if holder is not None and holder != job_id:
+                raise HumanBrowseConflictError(holder)
         if job["status"] == "done":
             self.db.update_job(job_id, query_index=0, page=0, pagination=None, query_done=0, error=None)
         self.db.release_phone_claims(job_id)
@@ -88,6 +132,8 @@ class JobManager:
             self._emit_job(job_id)
             return
         self.db.set_status(job_id, "running", None)
+        if job.get("fetch_phones"):
+            self._human_browse_holder = job_id
         self._tasks[job_id] = asyncio.create_task(self._run(job_id))
         self._emit_job(job_id)
 
@@ -112,6 +158,7 @@ class JobManager:
         if self.db.get_job(job_id):
             self.db.set_status(job_id, "stopped")
             self._emit_job(job_id)
+        self._release_human_browse(job_id)
 
     def resume_interrupted(self) -> None:
         for job_id in self.db.jobs_to_resume():
@@ -148,6 +195,8 @@ class JobManager:
             self.db.set_status(job_id, "error", str(exc)[:300])
             self._log(job_id, f"خطای کار: {exc}", "error")
             self._emit_job(job_id)
+        finally:
+            self._release_human_browse(job_id)
 
     async def _crawl(self, job_id: int) -> None:
         job = self.db.get_job(job_id)
@@ -206,8 +255,9 @@ class JobManager:
             list_finished = False
             list_refreshed = False
             batch_size = max(1, int(float(self.db.setting("phone_batch_size") or 4)))
-            batch_pause = max(0.0, float(self.db.setting("phone_batch_pause_sec") or 300))
+            batch_pause_base = max(0.0, float(self.db.setting("phone_batch_pause_sec") or 600))
             batch_count = 0
+            empty_refresh_streak = 0
             fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
 
             while not list_finished:
@@ -252,6 +302,17 @@ class JobManager:
                         continue
                     saved = self.db.update_listing(saved["id"], phone_status="pending") or saved
 
+                    ready = await self._prepare_account_for_reveal(job_id, account)
+                    if ready is None:
+                        self.db.set_status(job_id, "error", "no rate-safe browser account")
+                        self._log(job_id, "همه اکانت‌ها در کول‌داون یا سقف نرخ‌اند", "error")
+                        self._emit_job(job_id)
+                        return
+                    if ready.id != account.id:
+                        account = ready
+                        session = self.browsers.get(account.id)
+                        await session.open_search_list(list_url)
+                        fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
                     result = await self._human_open_ad(
                         job_id,
                         saved,
@@ -280,7 +341,8 @@ class JobManager:
                     elif result == "error":
                         batch_count += 1
                     if result in {"ok", "error"}:
-                        if batch_count >= batch_size and batch_pause > 0:
+                        if batch_count >= batch_size and batch_pause_base > 0:
+                            batch_pause = batch_pause_seconds(batch_pause_base)
                             mins = batch_pause / 60
                             self._log(
                                 job_id,
@@ -327,6 +389,7 @@ class JobManager:
                 fresh_queue = fresh_list_ads(ads, seen)
                 if fresh_queue:
                     empty_scrolls = 0
+                    empty_refresh_streak = 0
                     continue
 
                 empty_scrolls += 1
@@ -346,9 +409,35 @@ class JobManager:
                         empty_scrolls = 0
                         fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
                         if fresh_queue:
+                            empty_refresh_streak = 0
                             continue
-                    list_finished = True
-                    break
+                    wait_sec = refresh_backoff_seconds(empty_refresh_streak)
+                    empty_refresh_streak += 1
+                    self._log(
+                        job_id,
+                        f"آگهی تازه نیست؛ {wait_sec / 60:.0f} دقیقه تا رفرش بعدی (پشت‌سرهم {empty_refresh_streak})",
+                    )
+                    if not await self._sleep_interruptible(job_id, wait_sec):
+                        self.db.set_status(job_id, "stopped")
+                        self._emit_job(job_id)
+                        return
+                    opened = await session.open_search_list(list_url)
+                    if opened.get("needs_captcha"):
+                        account = await self._resolve_captcha_or_switch(job_id, account.id, session=session)
+                        if account is None:
+                            return
+                        session = self.browsers.get(account.id)
+                        await session.open_search_list(list_url)
+                    empty_scrolls = 0
+                    fresh_queue = fresh_list_ads(await session.collect_list_ads(), seen)
+                    if fresh_queue:
+                        empty_refresh_streak = 0
+                        continue
+                    job_loop = bool((self.db.get_job(job_id) or {}).get("loop"))
+                    if not job_loop and empty_refresh_streak >= REFRESH_BACKOFF_MAX_STREAK:
+                        list_finished = True
+                        break
+                    continue
 
             if switch_account:
                 await asyncio.sleep(1)
@@ -421,9 +510,7 @@ class JobManager:
     ) -> str:
         row = self.db.get_browser_account(account.id) or {}
         if pre_wait is None:
-            delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
-            delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
-            wait = jitter(delay_min, delay_max)
+            wait = phone_reveal_wait(row, self.db.settings())
         else:
             wait = max(0.0, float(pre_wait))
         label = row.get("phone") or row.get("label") or f"#{account.id}"
@@ -473,6 +560,13 @@ class JobManager:
             updates["specs_json"] = json.dumps(outcome["specs"], ensure_ascii=False)
         updated = self.db.update_listing(listing["id"], **updates)
         self.db.bump_browser_account_view(account.id)
+        if phone_status in {"done", "empty"}:
+            self.db.record_reveal_event(
+                account.id,
+                kind="reveal",
+                job_id=job_id,
+                token=str(listing.get("token") or ""),
+            )
         self.hub.publish("browser_account", self.db.get_browser_account(account.id))
         if phones:
             self._log(job_id, f"شماره {listing['token']}: {joined} · {label}")
@@ -656,20 +750,114 @@ class JobManager:
         )
         self.hub.publish("listing", _public_listing(updated, job["name"]))
 
+    def _reveal_counts(self, account_id: int) -> tuple[int, int]:
+        return (
+            self.db.count_reveal_events(account_id, 600),
+            self.db.count_reveal_events(account_id, 3600),
+        )
+
+    def _rolling_wait_seconds(self, account_id: int, reason: str) -> float:
+        window = 600 if reason == "rolling_10m" else 3600
+        oldest = self.db.oldest_reveal_in_window(account_id, window)
+        if not oldest:
+            return 5.0
+        start = parse_iso(oldest)
+        if not start:
+            return 5.0
+        elapsed = (tehran_now() - start).total_seconds()
+        return max(1.0, float(window) - elapsed)
+
+    def _cooldown_wait_seconds(self, row: dict[str, Any]) -> float:
+        until = parse_iso(row.get("captcha_cooldown_until"))
+        if not until:
+            return 0.0
+        return max(0.0, (until - tehran_now()).total_seconds())
+
+    async def _prepare_account_for_reveal(
+        self,
+        job_id: int,
+        account: AccountView,
+    ) -> AccountView | None:
+        cap_10m, cap_1h = self._rate_caps()
+        attempts = 0
+        while attempts < 24:
+            attempts += 1
+            row = self.db.get_browser_account(account.id) or {}
+            view = account_view_from_row(row)
+            if not available(view, today_key()):
+                alt = self._pick_browser_account_excluding(account.id)
+                if alt is None:
+                    return None
+                account = alt
+                continue
+            r10, r1h = self._reveal_counts(account.id)
+            blocked = account_rate_blocked(row, r10, r1h, cap_10m=cap_10m, cap_1h=cap_1h)
+            if not blocked:
+                return account
+            alt = self._pick_browser_account_for_rate(exclude_id=account.id)
+            if alt is not None:
+                account = alt
+                continue
+            if blocked in {"rolling_10m", "rolling_1h"}:
+                wait = self._rolling_wait_seconds(account.id, blocked)
+            elif blocked == "cooldown":
+                wait = self._cooldown_wait_seconds(row)
+            elif blocked == "benched":
+                wait = self._cooldown_wait_seconds(row)
+            else:
+                wait = 30.0
+            if wait <= 0:
+                continue
+            self._log(
+                job_id,
+                f"سقف نرخ اکانت {row.get('label') or account.id}; {wait:.0f}ث صبر",
+                "warn",
+            )
+            if not await self._sleep_interruptible(job_id, min(wait, 120.0)):
+                return None
+        return None
+
+    def _pick_browser_account_for_rate(self, exclude_id: int | None = None) -> AccountView | None:
+        cap_10m, cap_1h = self._rate_caps()
+        today = today_key()
+        candidates: list[AccountView] = []
+        for row in self.db.list_browser_accounts():
+            if exclude_id is not None and int(row["id"]) == int(exclude_id):
+                continue
+            view = account_view_from_row(row)
+            if not available(view, today):
+                continue
+            r10, r1h = self._reveal_counts(int(row["id"]))
+            if account_rate_blocked(row, r10, r1h, cap_10m=cap_10m, cap_1h=cap_1h):
+                continue
+            candidates.append(view)
+        if not candidates:
+            return None
+        index = self._account_cursor % len(candidates)
+        self._account_cursor = (index + 1) % len(candidates)
+        return candidates[index]
+
     def _active_browser_accounts(self) -> list[AccountView]:
         today = today_key()
-        return [
-            view
-            for view in (account_view_from_row(row) for row in self.db.list_browser_accounts())
-            if available(view, today)
-        ]
+        cap_10m, cap_1h = self._rate_caps()
+        views: list[AccountView] = []
+        for row in self.db.list_browser_accounts():
+            view = account_view_from_row(row)
+            if not available(view, today):
+                continue
+            r10, r1h = self._reveal_counts(int(row["id"]))
+            if account_rate_blocked(row, r10, r1h, cap_10m=cap_10m, cap_1h=cap_1h):
+                continue
+            views.append(view)
+        return views
 
     async def _mark_account_captcha(self, job_id: int, account_id: int) -> str:
         row = self.db.get_browser_account(account_id) or {}
         label = str(row.get("phone") or row.get("label") or f"#{account_id}")
-        self.db.update_browser_account(
-            account_id, status="captcha", last_error="needs captcha on contact"
-        )
+        cooldown = clamp_captcha_cooldown_sec(float(self.db.setting("captcha_cooldown_sec") or 2700))
+        penalty = apply_captcha_penalty_fields(row, cooldown, today_key=today_key())
+        self.db.update_browser_account(account_id, **penalty)
+        self.db.record_reveal_event(account_id, kind="captcha", job_id=job_id)
         updated = self.db.get_browser_account(account_id)
         self.hub.publish("browser_account", updated)
         status = self.browsers.note_captcha(
@@ -715,6 +903,27 @@ class JobManager:
             self._log(job_id, f"نمایش اکانت کپچا در VNC ناموفق: {exc}", "warn")
         waiter = session.wait_captcha_resolved if session is not None else self.browsers.wait_captcha_resolved
         await waiter()
+        row = self.db.get_browser_account(account_id) or {}
+        wait_left = self._cooldown_wait_seconds(row)
+        if wait_left > 0 or str(row.get("status")) == "benched":
+            new_status = str(row.get("status") or "cooldown")
+            if new_status == "captcha":
+                new_status = "cooldown"
+            self.db.update_browser_account(
+                account_id,
+                status=new_status,
+                last_error=row.get("last_error") or "post-captcha cooldown",
+            )
+            self.hub.publish("browser_account", self.db.get_browser_account(account_id))
+            self.hub.publish("captcha", self.browsers.captcha_status())
+            mins = max(1.0, wait_left) / 60
+            self._log(
+                job_id,
+                f"کپچا حل شد ولی اکانت {label} تا {mins:.0f} دقیقه دیگر کنار گذاشته می‌شود",
+                "warn",
+            )
+            alt = self._pick_browser_account_for_rate(exclude_id=account_id)
+            return alt
         self.db.update_browser_account(account_id, status="active", last_error=None)
         self.hub.publish("browser_account", self.db.get_browser_account(account_id))
         self.hub.publish("captcha", self.browsers.captcha_status())
@@ -802,9 +1011,7 @@ class JobManager:
         account: AccountView,
     ) -> str:
         row = self.db.get_browser_account(account.id) or {}
-        delay_min = float(row.get("delay_min") or self.db.setting("delay_min") or 20)
-        delay_max = float(row.get("delay_max") or self.db.setting("delay_max") or 40)
-        wait = jitter(delay_min, delay_max)
+        wait = phone_reveal_wait(row, self.db.settings())
         label = row.get("phone") or row.get("label") or f"#{account.id}"
         self._log(
             job_id,

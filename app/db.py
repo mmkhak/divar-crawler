@@ -36,11 +36,14 @@ CREATE TABLE IF NOT EXISTS browser_accounts (
     label TEXT NOT NULL,
     phone TEXT,
     status TEXT NOT NULL DEFAULT 'needs_login',
-    daily_cap INTEGER NOT NULL DEFAULT 50,
+    daily_cap INTEGER NOT NULL DEFAULT 80,
     views_today INTEGER NOT NULL DEFAULT 0,
     views_day TEXT,
-    delay_min REAL NOT NULL DEFAULT 20,
-    delay_max REAL NOT NULL DEFAULT 40,
+    delay_min REAL NOT NULL DEFAULT 25,
+    delay_max REAL NOT NULL DEFAULT 45,
+    captcha_cooldown_until TEXT,
+    captcha_hits_today INTEGER NOT NULL DEFAULT 0,
+    captcha_hits_day TEXT,
     last_error TEXT,
     last_used_at TEXT,
     created_at TEXT NOT NULL
@@ -95,15 +98,27 @@ CREATE TABLE IF NOT EXISTS logs (
     message TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reveal_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'reveal',
+    account_id INTEGER NOT NULL,
+    job_id INTEGER,
+    token TEXT,
+    seconds_since_prev REAL,
+    created_at TEXT NOT NULL
+);
 """
 
 DEFAULTS = {
     "anon_rps": "1",
-    "default_daily_cap": "50",
-    "delay_min": "20",
-    "delay_max": "40",
+    "default_daily_cap": "80",
+    "delay_min": "25",
+    "delay_max": "45",
     "phone_batch_size": "4",
-    "phone_batch_pause_sec": "300",
+    "phone_batch_pause_sec": "600",
+    "reveals_per_10_min": "5",
+    "reveals_per_hour": "20",
+    "captcha_cooldown_sec": "2700",
 }
 
 
@@ -137,6 +152,80 @@ class Database:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN loop INTEGER NOT NULL DEFAULT 0")
         if "source_url" not in cols:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
+        browser_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(browser_accounts)").fetchall()
+        }
+        if "captcha_cooldown_until" not in browser_cols:
+            self._conn.execute("ALTER TABLE browser_accounts ADD COLUMN captcha_cooldown_until TEXT")
+        if "captcha_hits_today" not in browser_cols:
+            self._conn.execute(
+                "ALTER TABLE browser_accounts ADD COLUMN captcha_hits_today INTEGER NOT NULL DEFAULT 0"
+            )
+        if "captcha_hits_day" not in browser_cols:
+            self._conn.execute("ALTER TABLE browser_accounts ADD COLUMN captcha_hits_day TEXT")
+        self._migrate_legacy_rate_values()
+
+    def _migrate_legacy_rate_values(self) -> None:
+        """Raise unsafe delays/caps from older panel defaults (e.g. 1–5s, cap 500)."""
+        from app.rate_policy import (
+            DEFAULT_DAILY_CAP,
+            DEFAULT_DELAY_MAX,
+            DEFAULT_DELAY_MIN,
+            MAX_DAILY_CAP,
+            MIN_PHONE_DELAY_SEC,
+            clamp_daily_cap,
+        )
+
+        with self._lock:
+            self._conn.execute(
+                """UPDATE browser_accounts
+                   SET delay_min=?, delay_max=?
+                   WHERE delay_min < ? OR delay_max < ?""",
+                (DEFAULT_DELAY_MIN, DEFAULT_DELAY_MAX, MIN_PHONE_DELAY_SEC, MIN_PHONE_DELAY_SEC),
+            )
+            self._conn.execute(
+                """UPDATE accounts
+                   SET delay_min=?, delay_max=?
+                   WHERE delay_min < ? OR delay_max < ?""",
+                (DEFAULT_DELAY_MIN, DEFAULT_DELAY_MAX, MIN_PHONE_DELAY_SEC, MIN_PHONE_DELAY_SEC),
+            )
+            self._conn.execute(
+                "UPDATE browser_accounts SET daily_cap=? WHERE daily_cap > ?",
+                (clamp_daily_cap(MAX_DAILY_CAP), MAX_DAILY_CAP),
+            )
+            self._conn.execute(
+                "UPDATE browser_accounts SET daily_cap=? WHERE daily_cap < 1",
+                (clamp_daily_cap(DEFAULT_DAILY_CAP),),
+            )
+            self._conn.execute(
+                "UPDATE accounts SET daily_cap=? WHERE daily_cap > ?",
+                (clamp_daily_cap(MAX_DAILY_CAP), MAX_DAILY_CAP),
+            )
+            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
+            for row in rows:
+                key = row["key"]
+                val = row["value"]
+                if key == "default_daily_cap":
+                    cap = clamp_daily_cap(int(float(val or 80)))
+                    if str(cap) != str(val):
+                        self._conn.execute(
+                            "UPDATE settings SET value=? WHERE key=?",
+                            (str(cap), key),
+                        )
+                elif key in {"delay_min", "delay_max"}:
+                    num = float(val or 0)
+                    if num < MIN_PHONE_DELAY_SEC:
+                        new_val = str(DEFAULT_DELAY_MIN if key == "delay_min" else DEFAULT_DELAY_MAX)
+                        self._conn.execute(
+                            "UPDATE settings SET value=? WHERE key=?",
+                            (new_val, key),
+                        )
+                elif key == "phone_batch_pause_sec" and float(val or 0) < 600:
+                    self._conn.execute(
+                        "UPDATE settings SET value=? WHERE key=?",
+                        ("600", key),
+                    )
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -467,8 +556,12 @@ class Database:
             self._conn.commit()
 
     def add_browser_account(self, fields: dict[str, Any]) -> dict[str, Any]:
+        from app.rate_policy import clamp_daily_cap, clamp_phone_delays, DEFAULT_DAILY_CAP
+
         stamp = now_iso()
         label = (fields.get("label") or "").strip() or "اکانت Chromium"
+        lo, hi = clamp_phone_delays(fields.get("delay_min"), fields.get("delay_max"))
+        cap = clamp_daily_cap(fields.get("daily_cap"), default=DEFAULT_DAILY_CAP)
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO browser_accounts(
@@ -477,10 +570,10 @@ class Database:
                 ) VALUES (?, NULL, 'needs_login', ?, 0, ?, ?, ?, ?)""",
                 (
                     label,
-                    int(fields.get("daily_cap") or 50),
+                    cap,
                     today_key(),
-                    float(fields.get("delay_min") or 20),
-                    float(fields.get("delay_max") or 40),
+                    lo,
+                    hi,
                     stamp,
                 ),
             )
@@ -554,11 +647,121 @@ class Database:
             self._conn.execute(
                 """UPDATE browser_accounts
                    SET views_today=0, views_day=?,
-                       status=CASE WHEN status='limited' THEN 'active' ELSE status END
+                       captcha_hits_today=CASE WHEN captcha_hits_day=? THEN captcha_hits_today ELSE 0 END,
+                       captcha_hits_day=?,
+                       status=CASE
+                         WHEN status='limited' THEN 'active'
+                         WHEN status='benched' AND (captcha_hits_day IS NULL OR captcha_hits_day!=?) THEN 'active'
+                         ELSE status
+                       END,
+                       captcha_cooldown_until=CASE
+                         WHEN status='benched' AND (captcha_hits_day IS NULL OR captcha_hits_day!=?) THEN NULL
+                         ELSE captcha_cooldown_until
+                       END
                    WHERE views_day IS NULL OR views_day!=?""",
-                (day, day),
+                (day, day, day, day, day, day),
             )
             self._conn.commit()
+
+    def oldest_reveal_in_window(
+        self, account_id: int, window_sec: int, *, kind: str = "reveal"
+    ) -> str | None:
+        from datetime import timedelta
+
+        cutoff = (datetime.now(TEHRAN) - timedelta(seconds=max(1, int(window_sec)))).isoformat(
+            timespec="seconds"
+        )
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT created_at FROM reveal_events
+                   WHERE account_id=? AND kind=? AND created_at>=?
+                   ORDER BY created_at ASC LIMIT 1""",
+                (account_id, kind, cutoff),
+            ).fetchone()
+        return str(row["created_at"]) if row else None
+
+    def count_reveal_events(self, account_id: int, window_sec: int, *, kind: str = "reveal") -> int:
+        from datetime import timedelta
+
+        cutoff = (datetime.now(TEHRAN) - timedelta(seconds=max(1, int(window_sec)))).isoformat(
+            timespec="seconds"
+        )
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT COUNT(*) c FROM reveal_events
+                   WHERE account_id=? AND kind=? AND created_at>=?""",
+                (account_id, kind, cutoff),
+            ).fetchone()
+        return int(row["c"] or 0)
+
+    def last_reveal_event_at(self, account_id: int, *, kind: str = "reveal") -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT created_at FROM reveal_events
+                   WHERE account_id=? AND kind=?
+                   ORDER BY id DESC LIMIT 1""",
+                (account_id, kind),
+            ).fetchone()
+        return str(row["created_at"]) if row else None
+
+    def record_reveal_event(
+        self,
+        account_id: int,
+        *,
+        kind: str = "reveal",
+        job_id: int | None = None,
+        token: str | None = None,
+        seconds_since_prev: float | None = None,
+    ) -> dict[str, Any]:
+        stamp = now_iso()
+        with self._lock:
+            prev = self._conn.execute(
+                """SELECT created_at FROM reveal_events
+                   WHERE account_id=? AND kind='reveal'
+                   ORDER BY id DESC LIMIT 1""",
+                (account_id,),
+            ).fetchone()
+            gap = seconds_since_prev
+            if gap is None and prev and kind == "reveal":
+                try:
+                    prev_dt = datetime.fromisoformat(prev["created_at"]).astimezone(TEHRAN)
+                    now_dt = datetime.fromisoformat(stamp).astimezone(TEHRAN)
+                    gap = (now_dt - prev_dt).total_seconds()
+                except ValueError:
+                    gap = None
+            cur = self._conn.execute(
+                """INSERT INTO reveal_events(
+                    kind, account_id, job_id, token, seconds_since_prev, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (kind, account_id, job_id, token, gap, stamp),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM reveal_events WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+        return dict(row)
+
+    def list_reveal_events(
+        self,
+        *,
+        account_id: int | None = None,
+        kind: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM reveal_events WHERE 1=1"
+        args: list[Any] = []
+        if account_id is not None:
+            sql += " AND account_id=?"
+            args.append(account_id)
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        args.extend([max(1, min(limit, 2000)), max(0, offset)])
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [dict(row) for row in rows]
 
 
 def _job(row: sqlite3.Row) -> dict[str, Any]:
