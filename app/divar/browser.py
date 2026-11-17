@@ -35,7 +35,8 @@ def clear_profile_locks(profile_dir: Path) -> None:
 LOGIN_URL = "https://divar.ir/my-divar"
 POST_URL = "https://divar.ir/v/{token}"
 CONTACT_HINT = ("contact_info", "postcontact")
-DEFAULT_VNC_URL = "https://divar2.pixlink.ir/vnc.html"
+# Empty = local desktop Chromium (no noVNC). Docker/compose sets VNC_URL.
+DEFAULT_VNC_URL = ""
 LOGIN_MARKERS = (
     "ورود به دیوار",
     "کد تأیید",
@@ -76,7 +77,7 @@ class BrowserSession:
         self._lock = None
         self.captcha_active = False
         self._captcha_gate = None
-        self.vnc_url = os.environ.get("VNC_URL", DEFAULT_VNC_URL).strip() or DEFAULT_VNC_URL
+        self.vnc_url = (os.environ.get("VNC_URL", DEFAULT_VNC_URL) or "").strip()
 
     def _get_lock(self):
         import asyncio
@@ -93,7 +94,7 @@ class BrowserSession:
         return self._captcha_gate
 
     def captcha_status(self) -> dict[str, Any]:
-        return {"active": self.captcha_active, "vnc_url": self.vnc_url}
+        return {"active": self.captcha_active, "vnc_url": self.vnc_url or None}
 
     def begin_captcha(self) -> dict[str, Any]:
         self.captcha_active = True
@@ -703,7 +704,7 @@ class BrowserSession:
             "needs_login": False,
             "needs_captcha": True,
             "error": "captcha",
-            "vnc_url": self.vnc_url,
+            "vnc_url": self.vnc_url or None,
         }
 
     async def _click_contact(self, page: Any) -> bool:
@@ -825,7 +826,7 @@ class BrowserPool:
         self._captcha_account_id: int | None = None
         self._captcha_label: str | None = None
         self._captcha_phone: str | None = None
-        self.vnc_url = os.environ.get("VNC_URL", DEFAULT_VNC_URL).strip() or DEFAULT_VNC_URL
+        self.vnc_url = (os.environ.get("VNC_URL", DEFAULT_VNC_URL) or "").strip()
 
     def profile_dir(self, account_id: int) -> Path:
         return self.root / str(account_id)
@@ -854,7 +855,7 @@ class BrowserPool:
             self._captcha_phone = None
         return {
             "active": active,
-            "vnc_url": self.vnc_url,
+            "vnc_url": self.vnc_url or None,
             "account_id": self._captcha_account_id,
             "account_label": self._captcha_label,
             "account_phone": self._captcha_phone,

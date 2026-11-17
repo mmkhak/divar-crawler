@@ -408,10 +408,11 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             await browsers.focus(account_id)
         except Exception as exc:
             raise HTTPException(500, f"نمایش اکانت ناموفق بود: {exc}") from exc
+        where = "روی VNC" if browsers.vnc_url else "روی دسکتاپ"
         return {
             "ok": True,
-            "vnc_url": browsers.vnc_url,
-            "message": "فقط پنجره این اکانت روی VNC مانده است.",
+            "vnc_url": browsers.vnc_url or None,
+            "message": f"فقط پنجره این اکانت {where} مانده است.",
             "account": account,
         }
 
@@ -500,10 +501,14 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(500, f"باز کردن Chromium ناموفق بود: {exc}") from exc
         db.update_browser_account(account_id, status="needs_login", last_error=None)
+        where = "در VNC" if browsers.vnc_url else "در پنجره Chromium"
         return {
             "ok": True,
-            "message": f"Chromium اکانت «{label}» باز شد (پنجره‌های دیگر بسته شد). در VNC وارد شو، بعد تأیید اتصال.",
-            "vnc_url": browsers.vnc_url,
+            "message": (
+                f"Chromium اکانت «{label}» باز شد (پنجره‌های دیگر بسته شد). "
+                f"{where} وارد شو، بعد تأیید اتصال."
+            ),
+            "vnc_url": browsers.vnc_url or None,
             "account": db.get_browser_account(account_id),
             "profile_dir": str(browsers.profile_dir(account_id)),
         }

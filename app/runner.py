@@ -894,7 +894,11 @@ class JobManager:
             return other
         self._log(
             job_id,
-            f"کپچا روی اکانت {label} — VNC را باز کن، کپچا را حل کن، بعد در پنل «کپچا حل شد» را بزن",
+            (
+                f"کپچا روی اکانت {label} — VNC را باز کن، کپچا را حل کن، بعد در پنل «کپچا حل شد» را بزن"
+                if self.browsers.vnc_url
+                else f"کپچا روی اکانت {label} — در پنجره Chromium حل کن، بعد در پنل «کپچا حل شد» را بزن"
+            ),
             "error",
         )
         try:
